@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.appcompat.widget.LinearLayoutCompat xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:background="@drawable/selector_git_cloud_tree_item"
+    android:gravity="center_vertical"
+    android:minHeight="40dp"
+    android:orientation="horizontal"
+    android:paddingStart="6dp"
+    android:paddingEnd="4dp">
+
+    <com.google.android.material.textview.MaterialTextView
+        android:id="@+id/name"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_weight="1"
+        android:ellipsize="middle"
+        android:singleLine="true"
+        android:textColor="@color/sync_device_text"
+        android:textSize="12sp"
+        tools:text="wgg代理[html]" />
+
+    <androidx.appcompat.widget.AppCompatImageView
+        android:id="@+id/edit"
+        android:layout_width="28dp"
+        android:layout_height="28dp"
+        android:layout_marginStart="4dp"
+        android:background="?attr/selectableItemBackgroundBorderless"
+        android:contentDescription="@string/script_edit_url"
+        android:padding="4dp"
+        android:src="@drawable/ic_git_cloud_edit"
+        android:visibility="gone"
+        app:tint="@color/dialog_text_button"
+        tools:visibility="visible" />
+
+</androidx.appcompat.widget.LinearLayoutCompat>

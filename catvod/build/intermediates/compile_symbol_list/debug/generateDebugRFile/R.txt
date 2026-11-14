@@ -1,0 +1,2 @@
+int array doh_name 0x0
+int array doh_url 0x0

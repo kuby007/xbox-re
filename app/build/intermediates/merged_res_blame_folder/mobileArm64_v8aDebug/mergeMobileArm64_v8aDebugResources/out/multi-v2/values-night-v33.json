@@ -1,0 +1,20 @@
+{
+    "logs": [
+        {
+            "outputFile": "com.fongmi.android.tv.app-mergeMobileArm64_v8aDebugResources-57:/values-night-v33/values-night-v33.xml",
+            "map": [
+                {
+                    "source": "/home/hatch/.gradle-hiker/caches/9.5.1/transforms/f607dd95808a56a0c9b2718baada0807/transformed/core-splashscreen-1.2.0/res/values-night-v33/values-night-v33.xml",
+                    "from": {
+                        "startLines": "2",
+                        "startColumns": "4",
+                        "startOffsets": "55",
+                        "endLines": "4",
+                        "endColumns": "12",
+                        "endOffsets": "215"
+                    }
+                }
+            ]
+        }
+    ]
+}

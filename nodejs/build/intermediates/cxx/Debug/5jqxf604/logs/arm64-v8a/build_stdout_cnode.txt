@@ -1,0 +1,2 @@
+ninja: Entering directory `/home/hatch/workspace/projects/xbox-hiker/work/xbox-re/nodejs/.cxx/Debug/5jqxf604/arm64-v8a'
+ninja: no work to do.

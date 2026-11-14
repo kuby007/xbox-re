@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- jarvis: 与 VodPlus 原版同构（内缩 6% + 品牌前景位图），背景仍为原 @color/white -->
+<inset xmlns:android="http://schemas.android.com/apk/res/android"
+    android:inset="6%">
+    <bitmap
+        android:gravity="fill"
+        android:src="@drawable/jarvis_logo_foreground" />
+</inset>

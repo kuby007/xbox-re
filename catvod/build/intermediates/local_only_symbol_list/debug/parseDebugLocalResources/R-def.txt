@@ -1,0 +1,4 @@
+R_DEF: Internal format may change without notice
+local
+array doh_name
+array doh_url

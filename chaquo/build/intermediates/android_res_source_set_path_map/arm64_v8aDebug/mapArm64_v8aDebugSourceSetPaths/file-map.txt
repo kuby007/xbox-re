@@ -1,0 +1,11 @@
+com.fongmi.chaquo-arm64_v8a-0 /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/chaquo/build/generated/res/pngs/arm64_v8a/debug
+com.fongmi.chaquo-updated_navigation_xml-1 /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/chaquo/build/generated/updated_navigation_xml/arm64_v8aDebug
+com.fongmi.chaquo-mergeArm64_v8aDebugResources-2 /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/chaquo/build/intermediates/incremental/arm64_v8aDebug/mergeArm64_v8aDebugResources/merged.dir
+com.fongmi.chaquo-mergeArm64_v8aDebugResources-3 /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/chaquo/build/intermediates/incremental/arm64_v8aDebug/mergeArm64_v8aDebugResources/stripped.dir
+com.fongmi.chaquo-arm64_v8aDebug-4 /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/chaquo/build/intermediates/merged_res/arm64_v8aDebug/mergeArm64_v8aDebugResources
+com.fongmi.chaquo-arm64_v8aDebug-5 /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/chaquo/build/intermediates/packaged_res/arm64_v8aDebug/packageArm64_v8aDebugResources
+com.fongmi.chaquo-arm64_v8a-6 /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/chaquo/src/arm64_v8a/res
+com.fongmi.chaquo-arm64_v8aDebug-7 /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/chaquo/src/arm64_v8aDebug/res
+com.fongmi.chaquo-debug-8 /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/chaquo/src/debug/res
+com.fongmi.chaquo-main-9 /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/chaquo/src/main/res
+gradleHome-0 /home/hatch/.gradle-hiker
