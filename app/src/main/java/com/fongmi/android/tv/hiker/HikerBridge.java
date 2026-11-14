@@ -41,14 +41,14 @@ public class HikerBridge {
 
     /* ------------------------------------------------------------------ 同步网络 */
 
-    /** 海阔 fetch / request：同步返回正文字符串。options 为 JSON 字符串（method/headers/body）。 */
+    /** 海阔 fetch / request：同步返回正文字符串。options 为 JSON 字符串（method/headers/body/timeout）。 */
     @JavascriptInterface
     public String req(String url, String options) {
         if (url == null || url.length() == 0) return "";
         Opt o = Opt.parse(options);
         Map<String, String> headers = o.headers;
-        if ("POST".equalsIgnoreCase(o.method)) return HikerHttp.post(url, o.body, headers);
-        return HikerHttp.get(url, headers);
+        if ("POST".equalsIgnoreCase(o.method)) return HikerHttp.post(url, o.body, headers, o.timeout);
+        return HikerHttp.get(url, headers, o.timeout);
     }
 
     /** 历史别名：不同版本规则里 fetch / request / ajax 都可能出现。 */
@@ -90,6 +90,33 @@ public class HikerBridge {
     @JavascriptInterface
     public boolean play(final String url, String title, String pic) {
         if (url == null || url.length() == 0) return false;
+        if (isDuplicatePush(url)) return true;   /* 与 report("play") 的二次投递合流，见 pushRich */
+        return pushUrl(url);
+    }
+
+    /**
+     * 富信息播放投递（HikerActivity.onBridgeEvent 解析 report("play", JSON) 后调用）。
+     *
+     * 宿主 PUSH 链的格式上限（实测，见 docs/HIKER-FULL-java-report.md）：
+     *   ServerEvent.push(String) -> HomeActivity.onServerEvent -> VideoActivity.push(text)
+     *   -> SiteApi push_agent：Result.url=id、parse=0、header 不设置。
+     * 即宿主只接受「单个 URL 字符串」：title / pic / headers / flag 在这条链上没有任何
+     * 透传字段（ServerEvent 的 name 字段只供 SETTING 事件使用，PUSH 工厂方法不设置它）。
+     * 因此本方法把 title/pic/headers/flag 记入日志留痕，最终仍只投递 url 本身；
+     * 需要 headers 的直链在宿主侧会缺头，这是宿主链的限制，不是本层吞掉。
+     */
+    public boolean pushRich(final String url, String title, String pic,
+                            Map<String, String> headers, String flag) {
+        if (url == null || url.length() == 0) return false;
+        android.util.Log.d("HikerBridge", "pushRich url=" + url
+                + " title=" + title + " pic=" + pic + " flag=" + flag
+                + " headers=" + (headers == null ? "" : headers.keySet().toString()));
+        if (isDuplicatePush(url)) return true;
+        return pushUrl(url);
+    }
+
+    /** 实际投递：首选宿主事件，失败兜底本地 HTTP 推送（与原 play 一致）。 */
+    private boolean pushUrl(final String url) {
         /* 首选：直接投递宿主的播放事件（Main 源集 → 两个 flavor 的 HomeActivity 都订阅了 PUSH）。
          * 这条路不依赖本地 HTTP 服务是否在跑 —— 服务只在部分入口里 start()，
          * 之前用 HTTP 推送会出现「点了没反应」。 */
@@ -107,6 +134,73 @@ public class HikerBridge {
             return r != null;
         } catch (Throwable t) {
             return false;
+        }
+    }
+
+    /* JS 契约是 bridge.play(...) 与 report("play", JSON) 双路投递同一个 URL，
+     * 不去重会让 VideoActivity 被同一地址连续 start 两次（闪退/重播）。
+     * 5 秒内同 URL 的第二次投递视为重复，直接报成功不重复推送。 */
+    private static volatile String sLastPushUrl = "";
+    private static volatile long sLastPushAt = 0;
+
+    private static synchronized boolean isDuplicatePush(String url) {
+        long now = System.currentTimeMillis();
+        if (url.equals(sLastPushUrl) && now - sLastPushAt < 5000) return true;
+        sLastPushUrl = url;
+        sLastPushAt = now;
+        return false;
+    }
+
+    /* ------------------------------------------------------------------ 剪贴板 */
+
+    /**
+     * 读剪贴板纯文本（口令自动获取/导入用）。ClipboardManager 必须在主线程访问，
+     * 而 @JavascriptInterface 运行在 JavaBridge 线程 —— 用同步等待切到主线程取，
+     * 超时/无 activity/无内容一律返回 ""，不抛异常。
+     */
+    @JavascriptInterface
+    public String readClipboard() {
+        if (activity == null) return "";
+        try {
+            final String[] out = {""};
+            final java.util.concurrent.CountDownLatch latch = new java.util.concurrent.CountDownLatch(1);
+            activity.runOnUiThread(() -> {
+                try {
+                    android.content.ClipboardManager cm = (android.content.ClipboardManager)
+                            activity.getSystemService(android.content.Context.CLIPBOARD_SERVICE);
+                    if (cm != null && cm.hasPrimaryClip()) {
+                        android.content.ClipData clip = cm.getPrimaryClip();
+                        if (clip != null && clip.getItemCount() > 0) {
+                            CharSequence t = clip.getItemAt(0).coerceToText(activity);
+                            if (t != null) out[0] = t.toString();
+                        }
+                    }
+                } catch (Throwable ignored) {
+                } finally {
+                    latch.countDown();
+                }
+            });
+            latch.await(2, java.util.concurrent.TimeUnit.SECONDS);
+            return out[0];
+        } catch (Throwable t) {
+            return "";
+        }
+    }
+
+    /** 写剪贴板（copy:// 动作的原生兜底；WebView 内 navigator.clipboard 常不可用）。 */
+    @JavascriptInterface
+    public void writeClipboard(final String text) {
+        if (activity == null || text == null) return;
+        try {
+            activity.runOnUiThread(() -> {
+                try {
+                    android.content.ClipboardManager cm = (android.content.ClipboardManager)
+                            activity.getSystemService(android.content.Context.CLIPBOARD_SERVICE);
+                    if (cm != null) cm.setPrimaryClip(android.content.ClipData.newPlainText("hiker", text));
+                } catch (Throwable ignored) {
+                }
+            });
+        } catch (Throwable ignored) {
         }
     }
 
@@ -259,9 +353,10 @@ public class HikerBridge {
     private static final class Opt {
         String method = "GET";
         String body = "";
+        int timeout = 0;   /* 秒；0 = HikerHttp 默认 */
         Map<String, String> headers = new HashMap<>();
 
-        /** 极简 JSON 解析，只取 method / body / headers 三个键，避免引入 gson 依赖。 */
+        /** 极简 JSON 解析，只取 method / body / headers / timeout，避免引入 gson 依赖。 */
         static Opt parse(String json) {
             Opt o = new Opt();
             if (json == null || json.length() == 0) return o;
@@ -269,6 +364,11 @@ public class HikerBridge {
             if (m != null && m.length() > 0) o.method = m;
             String b = str(json, "body");
             if (b != null) o.body = b;
+            java.util.regex.Matcher tm = java.util.regex.Pattern
+                    .compile("\"timeout\"\\s*:\\s*([0-9]+)").matcher(json);
+            if (tm.find()) {
+                try { o.timeout = Integer.parseInt(tm.group(1)); } catch (Throwable ignored) {}
+            }
             String h = obj(json, "headers");
             if (h != null) {
                 java.util.regex.Matcher mt = java.util.regex.Pattern

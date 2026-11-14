@@ -48,7 +48,7 @@ import java.util.zip.GZIPInputStream;
 public final class HikerApi {
 
     /* ------------------------------------------------------------ 状态（进程级单例） */
-    private static final Map<String, Map<String, String>> COOKIES = new HashMap<>();
+    /* Cookie 不再自建孤立表：统一走 HikerCookies（与 HikerHttp 共用、落盘），见审计 P0-4。 */
     private static final Map<String, CacheEntry> CACHE = new HashMap<>();
     private static final Map<String, byte[]> FILES = new HashMap<>();
     private static final List<String> EVENTS = Collections.synchronizedList(new ArrayList<String>());
@@ -92,6 +92,11 @@ public final class HikerApi {
         return f;
     }
 
+    /** 文件根路径（包内可见）：HikerCookies 落盘 cookies.txt 时与本类共用同一目录。 */
+    static String rootPath() {
+        return root().getAbsolutePath();
+    }
+
     private static void mark(String kind, String name) {
         EVENTS.add(kind + ":" + name);
         if (EVENTS.size() > 300) EVENTS.remove(0);
@@ -101,7 +106,7 @@ public final class HikerApi {
     public static String report() {
         Map<String, Object> m = new LinkedHashMap<>();
         m.put("events", new ArrayList<>(EVENTS));
-        m.put("cookies", COOKIES.size());
+        m.put("cookies", HikerCookies.size());
         m.put("cache", CACHE.size());
         m.put("files", FILES.size());
         m.put("root", root().getAbsolutePath());
@@ -136,7 +141,13 @@ public final class HikerApi {
                 return "";   /* 返回 JS 对象的 API 由 hiker_api_surface.js 的 CryptoJS 兼容对象承担 */
             }
             if ("getCookie".equals(n)) return getCookie(HikerJson.s(a, 0, ""));
+            if ("setCookie".equals(n)) {
+                HikerCookies.putFromHeader(HikerJson.s(a, 0, ""), HikerJson.s(a, 1, ""));
+                return getCookie(HikerJson.s(a, 0, ""));
+            }
             if ("fetchCookie".equals(n)) return fetchCookie(a);
+            if ("fetchFull".equals(n)) return fetchFull(a);
+            if ("unzipRule".equals(n)) return unzipRule(HikerJson.s(a, 0, ""));
             if ("fetchCache".equals(n) || "requireCache".equals(n)) return fetchCache(a);
             if ("fetchCodeByWebView".equals(n) || "x5Rule".equals(n)
                     || "parseLazyRuleAsync".equals(n) || "refreshX5WebView".equals(n)) {
@@ -195,7 +206,7 @@ public final class HikerApi {
                 "parseLazyRuleAsync", "getIP", "convertBase64Image", "createQRCode",
                 "requireCache", "fixM3u8", "refreshVideoUrl", "refreshX5WebView", "getCpuAbi",
                 "findReachableIP", "ipping", "getCryptoJS2", "writeHexFile", "readFile",
-                "writeFile", "saveFile", "fileExist"
+                "writeFile", "saveFile", "fileExist", "setCookie", "fetchFull", "unzipRule"
         };
         for (String s : names) METHODS.add(s);
     }
@@ -293,26 +304,11 @@ public final class HikerApi {
     }
 
     private static String getCookie(String url) {
-        Map<String, String> jar = COOKIES.get(hostOf(url));
-        if (jar == null || jar.isEmpty()) return "";
-        StringBuilder sb = new StringBuilder();
-        for (Map.Entry<String, String> e : jar.entrySet()) {
-            if (sb.length() > 0) sb.append("; ");
-            sb.append(e.getKey()).append('=').append(e.getValue());
-        }
-        return sb.toString();
+        return HikerCookies.get(url);
     }
 
     private static void putCookie(String url, List<String> setCookies) {
-        if (setCookies == null || setCookies.isEmpty()) return;
-        String host = hostOf(url);
-        Map<String, String> jar = COOKIES.get(host);
-        if (jar == null) { jar = new LinkedHashMap<>(); COOKIES.put(host, jar); }
-        for (String line : setCookies) {
-            String first = line.split(";", 2)[0].trim();
-            int p = first.indexOf('=');
-            if (p > 0) jar.put(first.substring(0, p), first.substring(p + 1));
-        }
+        HikerCookies.putFromSetCookie(url, setCookies);
     }
 
     /** fetchCookie：GET 一次，收集 Set-Cookie 入 jar，返回可直接放进 Cookie 头的字符串。 */
@@ -327,6 +323,210 @@ public final class HikerApi {
         String body = HikerJson.str(res.get("body"));
         CACHE.put("body:" + url, new CacheEntry(body, System.currentTimeMillis()));
         return getCookie(url);
+    }
+
+    /**
+     * fetchFull（HIKER-FULL 契约）：参数 [url, optionsJson]，optionsJson 为
+     * {method, headers, body, timeout(秒)}；返回 JSON 字符串
+     * {"status":n,"headers":{...},"body":"..."}，headers 含合并的 Set-Cookie，
+     * 供 JS 侧实现 fetch 的 withHeaders / onlyHeaders 语义（审计 P0-5）。
+     * 同步执行；失败返回 status:0、空 headers、空 body，不抛异常。
+     * Cookie 的存取由 HikerHttp.request 统一处理（与 getCookie 同一 jar）。
+     */
+    private static String fetchFull(List<Object> a) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        String url = HikerJson.s(a, 0, "");
+        Map<String, Object> opt = HikerJson.map(a, 1);
+        if (opt == null && a.size() > 1 && a.get(1) instanceof String) {
+            Object p = HikerJson.parse(HikerJson.s(a, 1, ""));
+            if (p instanceof Map) opt = castMap(p);
+        }
+        String method = "GET";
+        String body = null;
+        int timeout = 0;
+        Map<String, String> headers = new LinkedHashMap<>();
+        if (opt != null) {
+            String m = HikerJson.str(opt.get("method"));
+            if (m.length() > 0) method = m;
+            Object b = opt.get("body");
+            if (b != null) body = HikerJson.str(b);
+            Object t = opt.get("timeout");
+            if (t instanceof Number) timeout = ((Number) t).intValue();
+            Object h = opt.get("headers");
+            if (h instanceof Map) {
+                for (Map.Entry<String, Object> e : castMap(h).entrySet()) {
+                    headers.put(e.getKey(), HikerJson.str(e.getValue()));
+                }
+            }
+        }
+        if (url.length() == 0) {
+            out.put("status", 0);
+            out.put("headers", new LinkedHashMap<String, Object>());
+            out.put("body", "");
+            return HikerJson.stringify(out);
+        }
+        HikerHttp.Result r = HikerHttp.request(method, url, body, headers, timeout);
+        Map<String, Object> hm = new LinkedHashMap<>();
+        for (Map.Entry<String, String> e : r.headers.entrySet()) hm.put(e.getKey(), e.getValue());
+        out.put("status", r.status);
+        out.put("headers", hm);
+        out.put("body", r.body == null ? "" : r.body);
+        return HikerJson.stringify(out);
+    }
+
+    /* ------------------------------------------------------------ .hkzip 规则包解包 */
+
+    private static final long ZIP_FILE_MAX = 16L * 1024 * 1024;
+    private static final long ZIP_TOTAL_MAX = 64L * 1024 * 1024;
+
+    /**
+     * unzipRule（HIKER-FULL 契约）：参数 [base64zip]，解海阔规则包
+     * （.hkzip/.hk 实际是 zip：rule.json + require.json + libs.zip + data.zip）。
+     * 返回 {"ok":true,"rules":[rule.json 文本...],"stored":[落盘文件名...]}；
+     * 坏包 / 无 rule.json 返回 {"ok":false,"error":"..."}，不抛异常。
+     * 安全：Zip Slip 防护（条目名规范化后不许逃出 root）、单文件上限 16MB、总量 64MB。
+     * rule.json 找根目录或一层子目录；libs.zip/data.zip 整体落盘后由
+     * expandInnerZip 展开内层条目（libs.zip → libs/<name>，data.zip → 原相对路径）。
+     */
+    private static String unzipRule(String b64) {
+        Map<String, Object> fail = new LinkedHashMap<>();
+        List<Object> rules = new ArrayList<>();
+        List<Object> stored = new ArrayList<>();
+        try {
+            if (b64 == null || b64.trim().length() == 0) {
+                fail.put("ok", false);
+                fail.put("error", "empty input");
+                return HikerJson.stringify(fail);
+            }
+            byte[] zip = b64Decode(b64.trim());
+            if (zip.length == 0) {
+                fail.put("ok", false);
+                fail.put("error", "invalid base64/zip");
+                return HikerJson.stringify(fail);
+            }
+            java.util.zip.ZipInputStream zin = new java.util.zip.ZipInputStream(
+                    new java.io.ByteArrayInputStream(zip));
+            java.util.zip.ZipEntry e;
+            long total = 0;
+            boolean overflow = false;
+            while ((e = zin.getNextEntry()) != null) {
+                String name = e.getName() == null ? "" : e.getName().replace('\\', '/');
+                if (name.length() == 0 || name.endsWith("/")) continue;
+                ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                byte[] buf = new byte[8192];
+                int n;
+                while ((n = zin.read(buf)) != -1) {
+                    bos.write(buf, 0, n);
+                    if (bos.size() > ZIP_FILE_MAX) { overflow = true; break; }
+                }
+                if (overflow) break;
+                total += bos.size();
+                if (total > ZIP_TOTAL_MAX) { overflow = true; break; }
+                byte[] data = bos.toByteArray();
+                String base = baseName(name);
+                if ("rule.json".equals(base) && depthOf(name) <= 1) {
+                    rules.add(new String(data, "UTF-8"));
+                } else if ("require.json".equals(base) || "libs.zip".equals(base)
+                        || "data.zip".equals(base) || "data2.zip".equals(base)) {
+                    String rel = writeBytesKeepPath(name, data);
+                    if (rel != null) stored.add(rel);
+                    /* 内层展开（HIKER-FULL 合并修正）：libs.zip 条目是 require.json
+                     * file 字段对应的 MD5 名 JS，须落到 libs/<name> 才可被
+                     * $.require 按名读到；data.zip 条目保留其相对路径。 */
+                    if (base.endsWith(".zip")) expandInnerZip(base, data, stored);
+                }
+            }
+            zin.close();
+            if (overflow) {
+                fail.put("ok", false);
+                fail.put("error", "zip too large");
+                return HikerJson.stringify(fail);
+            }
+            if (rules.isEmpty()) {
+                fail.put("ok", false);
+                fail.put("error", "no rule.json in zip");
+                return HikerJson.stringify(fail);
+            }
+            Map<String, Object> out = new LinkedHashMap<>();
+            out.put("ok", true);
+            out.put("rules", rules);
+            out.put("stored", stored);
+            return HikerJson.stringify(out);
+        } catch (Throwable t) {
+            mark("error", "unzipRule:" + t.getClass().getSimpleName());
+            Map<String, Object> f2 = new LinkedHashMap<>();
+            f2.put("ok", false);
+            f2.put("error", String.valueOf(t.getMessage()));
+            return HikerJson.stringify(f2);
+        }
+    }
+
+    /** 展开 libs.zip / data.zip 内层条目到 root 下（libs/ 前缀或原相对路径）。 */
+    private static void expandInnerZip(String container, byte[] zipData, List<Object> stored) {
+        try {
+            String prefix = "libs.zip".equals(container) ? "libs/" : "";
+            java.util.zip.ZipInputStream zin = new java.util.zip.ZipInputStream(
+                    new java.io.ByteArrayInputStream(zipData));
+            java.util.zip.ZipEntry e;
+            long innerTotal = 0;
+            while ((e = zin.getNextEntry()) != null) {
+                String name = e.getName() == null ? "" : e.getName().replace('\\', '/');
+                if (name.length() == 0 || name.endsWith("/")) continue;
+                ByteArrayOutputStream bos = new ByteArrayOutputStream();
+                byte[] buf = new byte[8192];
+                int n;
+                boolean over = false;
+                while ((n = zin.read(buf)) != -1) {
+                    bos.write(buf, 0, n);
+                    if (bos.size() > ZIP_FILE_MAX) { over = true; break; }
+                }
+                if (over) break;
+                innerTotal += bos.size();
+                if (innerTotal > ZIP_TOTAL_MAX) break;
+                String rel = writeBytesKeepPath(prefix + name, bos.toByteArray());
+                if (rel != null) stored.add(rel);
+            }
+            zin.close();
+        } catch (Throwable t) {
+            mark("error", "expandInnerZip:" + t.getClass().getSimpleName());
+        }
+    }
+
+    private static String baseName(String path) {
+        int i = path.lastIndexOf('/');
+        return i >= 0 ? path.substring(i + 1) : path;
+    }
+
+    private static int depthOf(String path) {
+        int d = 0;
+        for (int i = 0; i < path.length(); i++) if (path.charAt(i) == '/') d++;
+        return d;
+    }
+
+    /**
+     * 按包内相对路径落盘（供 JS 侧按 require.json / hiker://files/ 语义读回），
+     * 返回相对 root 的路径；路径逃逸（../）直接丢弃返回 null。
+     */
+    private static String writeBytesKeepPath(String rel, byte[] data) {
+        try {
+            String clean = rel.replace('\\', '/');
+            java.io.File rootF = root();
+            java.io.File target = new java.io.File(rootF, clean);
+            String canonRoot = rootF.getCanonicalPath();
+            String canonTarget = target.getCanonicalPath();
+            if (!canonTarget.startsWith(canonRoot + java.io.File.separator)) return null;
+            File parent = target.getParentFile();
+            if (parent != null && !parent.exists()) parent.mkdirs();
+            FileOutputStream os = new FileOutputStream(target);
+            os.write(data);
+            os.close();
+            FILES.put(clean, data);
+            FILES.put(safeName(clean), data);   /* 兼容 readFile 的拍平命名读回 */
+            return clean;
+        } catch (Throwable t) {
+            mark("error", "writeBytesKeepPath");
+            return null;
+        }
     }
 
     /** fetchCache：带 TTL 的内存缓存；命中直接返回，未命中走同步 GET。 */

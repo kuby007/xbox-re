@@ -96,12 +96,15 @@
                 android:value="androidx.startup" />
         </provider>
 
-        <!-- 阶段六：海阔独立入口。独立 WebView / 独立同步桥，不复用首页 webOverlay。 -->
+        <!-- 阶段六：海阔独立入口。独立 WebView / 独立同步桥，不复用首页 webOverlay。
+             HIKER-FULL 横屏修复：main 不再写死 sensorLandscape（那是手机版一进海阔
+             先被强制横屏的根因）；方向按 flavor 重声明 —— mobile=fullUser、
+             leanback=sensorLandscape；main 兜底 unspecified 跟随系统/用户。 -->
         <activity
             android:name=".hiker.HikerActivity"
             android:configChanges="screenSize|smallestScreenSize|screenLayout|orientation"
             android:exported="false"
-            android:screenOrientation="sensorLandscape" />
+            android:screenOrientation="unspecified" />
 
         <activity
             android:name=".ui.activity.CrashActivity"

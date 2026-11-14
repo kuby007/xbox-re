@@ -326,11 +326,34 @@
     myVars: {},      /* 规则名@key -> value */
     vars: {},
     items: {},       /* 当前页面条目 id -> item（updateItem/findItem 用） */
+    kv: {},          /* [A-P1-3] getItem/setItem 的持久 KV（与页面条目注册表分开，
+                        对齐官方 kvFile 语义；findItem/updateItem 仍走 items） */
     files: {},       /* 内存文件（未落盘时的兜底） */
     modules: {},     /* 模块缓存 ruleKey/path -> exports */
     rawRules: {}     /* 规则原文缓存 */
   };
   HK.STORE = STORE;
+
+  /* [A-P1-3] 变量持久化：vars / myVars / kv 落 localStorage，重启不丢登录态。
+   * 只存可 JSON 化的值；存不了（循环引用/超限）就静默跳过，不打断规则。 */
+  function persistSave() {
+    try {
+      if (!global.localStorage) return;
+      global.localStorage.setItem('hk_vars_v1', JSON.stringify(STORE.vars));
+      global.localStorage.setItem('hk_myvars_v1', JSON.stringify(STORE.myVars));
+      global.localStorage.setItem('hk_kv_v1', JSON.stringify(STORE.kv));
+    } catch (e) {}
+  }
+  function persistLoad() {
+    try {
+      if (!global.localStorage) return;
+      var v = global.localStorage.getItem('hk_vars_v1'); if (v) STORE.vars = jparse(v, {}) || {};
+      var m = global.localStorage.getItem('hk_myvars_v1'); if (m) STORE.myVars = jparse(m, {}) || {};
+      var k = global.localStorage.getItem('hk_kv_v1'); if (k) STORE.kv = jparse(k, {}) || {};
+    } catch (e) {}
+  }
+  persistLoad();
+  HK.persistSave = persistSave;
 
   var UAM = 'Mozilla/5.0 (Linux; Android 13; SM-S9080) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36';
   var UAP = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
@@ -338,21 +361,36 @@
   function myKey(k, ruleName) { return (ruleName || HK.ruleName() || '') + '@' + str(k); }
 
   /* 页面上下文：当前站点/规则/参数 */
-  var PAGE = { rule: null, ruleName: '', url: '', keyword: '', page: 1, title: '', pic: '' };
+  var PAGE = { rule: null, ruleName: '', url: '', keyword: '', page: 1, title: '', pic: '',
+               input: '', params: {}, reversed: false };
   HK.page = PAGE;
   HK.setPage = function (o) { for (var k in o) if (has(o, k)) PAGE[k] = o[k]; };
   HK.ruleName = function () { return PAGE.ruleName || (PAGE.rule && PAGE.rule.title) || ''; };
 
   /* 结果收集器：setResult / setHomeResult / d.push 最终都落这里 */
-  var OUT = { result: undefined, hasResult: false, items: [], events: [] };
+  var OUT = { result: undefined, hasResult: false, items: [], events: [], d: [], preResult: undefined };
   HK.OUT = OUT;
-  HK.resetOut = function () { OUT.result = undefined; OUT.hasResult = false; OUT.items = []; };
+  HK.resetOut = function () { OUT.result = undefined; OUT.hasResult = false; OUT.items = []; OUT.d = []; OUT.preResult = undefined; };
+  /* [A-P0-12] @rule= 预取正文通道：UI 在跑 @rule 代码前把目标页正文放进来，
+   * 规则用 getResCode() 取（HoHoJ 的 searchParse 就靠它）。 */
+  HK.resCode = '';
+  HK.lastChapterRule = '';
+  HK.setResCode = function (v) { HK.resCode = str(v); return HK.resCode; };
+  HK.getResCode = function () { return HK.resCode || ''; };
 
-  function emit(name, payload) {
+  function rawEmit(name, payload) {
     try { if (bridge && typeof bridge.report === 'function') bridge.report(name, typeof payload === 'string' ? payload : JSON.stringify(payload)); }
     catch (e) {}
   }
+  /* [A-P1-1] 原实现里 UI 覆盖 HK.emit 并不能拦截引擎内部 emit（内部走的是
+   * 本地函数引用），updateItem/addItem 等事件 UI 永远收不到。这里改成钩子：
+   * 引擎内部统一走 emit()，UI 通过 HK.__emitHook 订阅，rawEmit 保证桥上报不丢。 */
+  function emit(name, payload) {
+    rawEmit(name, payload);
+    if (HK.__emitHook) { try { HK.__emitHook(name, payload); } catch (e) {} }
+  }
   HK.emit = emit;
+  HK.rawEmit = rawEmit;
 
   function fileRead(p) {
     var path = str(p);
@@ -403,6 +441,383 @@
   }
   HK.findPage = findPage;
 
+  /* ==================================================================== *
+   * 4b. [A] 桥接调用 / URL 工具 / 选择 / CryptoJS / fetch 语义 / 播放解析
+   * ==================================================================== */
+  function bridgeCall(name, args) {
+    if (bridge && typeof bridge.call === 'function') {
+      try { var r = bridge.call(name, JSON.stringify(args || [])); return (r === null || r === undefined) ? null : String(r); }
+      catch (e) { return null; }
+    }
+    return null;
+  }
+  HK.bridgeCall = bridgeCall;
+
+  function hostOf(u) {
+    var m = /^https?:\/\/([^\/:?#]+)/i.exec(str(u));
+    return m ? m[1] : '';
+  }
+  HK.hostOf = hostOf;
+
+  function parseQuery(u) {
+    var out = {}, s = str(u), i = s.indexOf('?');
+    if (i < 0) return out;
+    var qs = s.slice(i + 1).split('#')[0].split('&');
+    for (var j = 0; j < qs.length; j++) {
+      if (!qs[j]) continue;
+      var p = qs[j].split('=');
+      try { out[decodeURIComponent(p[0])] = decodeURIComponent(p.slice(1).join('=') || ''); }
+      catch (e) { out[p[0]] = p.slice(1).join('=') || ''; }
+    }
+    return out;
+  }
+  HK.parseQuery = parseQuery;
+
+  /* [A-P1-7] joinUrl：相对地址按 base 补全（死文件 jst4 里有、运行时缺） */
+  function joinUrl(base, rel) {
+    var b = str(base), r = str(rel);
+    if (!r) return b;
+    if (/^[a-z][a-z0-9+.-]*:/i.test(r) || r.indexOf('//') === 0) return r;
+    var m = /^([a-z][a-z0-9+.-]*:\/\/[^\/]+)/i.exec(b);
+    if (!m) return r;
+    var origin = m[1];
+    if (r.charAt(0) === '/') return origin + r;
+    var path = b.slice(origin.length).split('#')[0].split('?')[0];
+    var dir = path.slice(0, path.lastIndexOf('/') + 1) || '/';
+    var parts = (dir + r).split('/'), out = [];
+    for (var i = 0; i < parts.length; i++) {
+      if (parts[i] === '..') { if (out.length > 1) out.pop(); }
+      else if (parts[i] !== '.') out.push(parts[i]);
+    }
+    return origin + out.join('/');
+  }
+  HK.joinUrl = joinUrl;
+
+  /* [A-P0-8] 真选择：优先原生 prompt（HikerActivity 的 onJsPrompt 是真对话框，
+   * 用户实际选，不是静默第一项）；无 prompt 的环境才退回默认项并留痕。
+   * 选项可为字符串或 {title/name, value} 对象；返回选中项的 value（对象）或原文。 */
+  function pickOption(opts, defIdx, title) {
+    var list = [], i, o;
+    if (Object.prototype.toString.call(opts) === '[object Array]') {
+      for (i = 0; i < opts.length; i++) {
+        o = opts[i];
+        if (o && typeof o === 'object') list.push({ label: str(o.title || o.name || o.value || ''), value: (o.value !== undefined ? o.value : (o.title || o.name || '')) });
+        else list.push({ label: str(o), value: o });
+      }
+    }
+    if (!list.length) return null;
+    var d = (typeof defIdx === 'number' && defIdx >= 0 && defIdx < list.length) ? defIdx : 0;
+    if (global.prompt) {
+      var lines = [];
+      for (i = 0; i < list.length; i++) lines.push((i + 1) + '. ' + list[i].label);
+      var ans = global.prompt((title ? str(title) + '\n' : '') + lines.join('\n'), String(d + 1));
+      if (ans === null || ans === undefined) return null;
+      var n = parseInt(ans, 10);
+      if (!isNaN(n) && n >= 1 && n <= list.length) return list[n - 1].value;
+      for (i = 0; i < list.length; i++) if (list[i].label === str(ans)) return list[i].value;
+      return list[d].value;
+    }
+    emit('hk.log', 'pickOption: 无 prompt 环境，退回默认项');
+    return list[d].value;
+  }
+  HK.pickOption = pickOption;
+
+  HK.COL_TYPES = ['avatar','big_big_blank_block','big_blank_block','blank_block','card_pic_1',
+    'card_pic_2','card_pic_2_2','card_pic_2_2_left','card_pic_3','card_pic_3_center','flex_button',
+    'footer','header','icon_1_left_pic','icon_1_search','icon_2','icon_2_round','icon_3_fill',
+    'icon_3_round_fill','icon_4','icon_4_card','icon_5','icon_5_no_crop','icon_round_4',
+    'icon_round_small_4','icon_small_3','icon_small_4','input','line','line_blank','long_text',
+    'movie_1','movie_1_left_pic','movie_1_vertical_pic','movie_1_vertical_pic_blur','movie_2',
+    'movie_3','movie_3_marquee','pic_1','pic_1_card','pic_1_center','pic_1_full','pic_2',
+    'pic_2_card','pic_3','pic_3_square','rich_text','scroll_button','text_1','text_2','text_3',
+    'text_4','text_5','text_center_1','text_icon','video','x5_webview_single'];
+
+  /* ---------- CryptoJS 兼容子集 [A-P0-3] ----------
+   * 覆盖语料实际用到的面：enc.Hex/Utf8/Base64/Latin1、MD5/SHA1/SHA256、
+   * HmacMD5/HmacSHA1/HmacSHA256、AES(CBC/ECB + Pkcs7，经 Java 桥真 AES)。
+   * 摘要/HMAC 为纯 JS 真实现（有已知向量自测，见 docs/hiker-js-selftest.js）；
+   * AES 的密钥/IV 以 Latin1 字节串经桥传给 HikerApi.aesEncode（ASCII 密钥精确，
+   * 非 ASCII 字节密钥受 Java String 语义限制，属已知边界）。
+   * getCryptoJS() 按官方语义返回「源码字符串」：规则 eval(getCryptoJS()) 后
+   * CryptoJS 变量就指向 HK.cryptoObject，与直接读作用域 CryptoJS 等价。 */
+  function bytesToLatin1(bytes) { var s = ''; for (var i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i] & 0xFF); return s; }
+  function latin1ToBytes(s) { var t = str(s), o = []; for (var i = 0; i < t.length; i++) o.push(t.charCodeAt(i) & 0xFF); return o; }
+  function rawB64eBytes(bytes) {
+    var out = '', i, c1, c2, c3;
+    for (i = 0; i < bytes.length; i += 3) {
+      c1 = bytes[i] & 0xFF; c2 = i + 1 < bytes.length ? bytes[i + 1] & 0xFF : NaN; c3 = i + 2 < bytes.length ? bytes[i + 2] & 0xFF : NaN;
+      out += B64C.charAt(c1 >> 2);
+      out += B64C.charAt(((c1 & 3) << 4) | (isNaN(c2) ? 0 : c2 >> 4));
+      out += isNaN(c2) ? '=' : B64C.charAt(((c2 & 15) << 2) | (isNaN(c3) ? 0 : c3 >> 6));
+      out += isNaN(c3) ? '=' : B64C.charAt(c3 & 63);
+    }
+    return out;
+  }
+  function rawB64dBytes(s) {
+    var t = str(s).replace(/[\s\r\n]/g, '').replace(/-/g, '+').replace(/_/g, '/');
+    var pad = t.length % 4; if (pad) t += pad === 2 ? '==' : (pad === 3 ? '=' : '==');
+    var out = [], i, b0, b1, b2, b3;
+    for (i = 0; i < t.length; i += 4) {
+      b0 = B64C.indexOf(t.charAt(i)); b1 = B64C.indexOf(t.charAt(i + 1));
+      b2 = B64C.indexOf(t.charAt(i + 2)); b3 = B64C.indexOf(t.charAt(i + 3));
+      if (b0 < 0 || b1 < 0) continue;
+      out.push((b0 << 2) | (b1 >> 4));
+      if (b2 >= 0 && t.charAt(i + 2) !== '=') out.push(((b1 & 15) << 4) | (b2 >> 2));
+      if (b3 >= 0 && t.charAt(i + 3) !== '=') out.push(((b2 & 3) << 6) | b3);
+    }
+    return out;
+  }
+  function hexToBytesArr(h) {
+    var s = str(h).replace(/[^0-9a-fA-F]/g, ''), o = [];
+    for (var i = 0; i + 1 < s.length; i += 2) o.push(parseInt(s.substr(i, 2), 16));
+    return o;
+  }
+  function bytesToHex(bytes) {
+    var s = ''; for (var i = 0; i < bytes.length; i++) { var h = (bytes[i] & 0xFF).toString(16); s += h.length === 1 ? '0' + h : h; }
+    return s;
+  }
+
+  function WA(words, sigBytes) { this.words = words || []; this.sigBytes = (sigBytes === undefined) ? this.words.length * 4 : sigBytes; }
+  WA.prototype.toString = function (enc) { return (enc || CJ.enc.Hex).stringify(this); };
+  WA.prototype.concat = function (w2) {
+    var a = bytesFromWA(this), b = bytesFromWA(w2), i;
+    for (i = 0; i < b.length; i++) a.push(b[i]);
+    var r = waFromBytes(a); this.words = r.words; this.sigBytes = r.sigBytes; return this;
+  };
+  function waFromBytes(bytes) {
+    var words = [], i;
+    for (i = 0; i < bytes.length; i++) words[i >>> 2] = (words[i >>> 2] || 0) | ((bytes[i] & 0xFF) << (24 - (i % 4) * 8));
+    return new WA(words, bytes.length);
+  }
+  function bytesFromWA(w) {
+    var out = [], i;
+    for (i = 0; i < w.sigBytes; i++) out.push((w.words[i >>> 2] >>> (24 - (i % 4) * 8)) & 0xFF);
+    return out;
+  }
+  function waCreate(x) {
+    if (x instanceof WA) return x;
+    if (typeof x === 'string') return CJ.enc.Utf8.parse(x);
+    if (Object.prototype.toString.call(x) === '[object Array]') return waFromBytes(x);
+    if (x && typeof x === 'object' && x.words) return new WA(x.words, x.sigBytes);
+    return new WA([], 0);
+  }
+
+  function sha1Bytes(msg) {
+    var bytes = msg.slice(), ml = bytes.length;
+    bytes.push(0x80);
+    while (bytes.length % 64 !== 56) bytes.push(0);
+    var hi = Math.floor(ml / 0x20000000), lo = (ml * 8) >>> 0, i, t;
+    for (i = 3; i >= 0; i--) bytes.push((hi >>> (i * 8)) & 0xFF);
+    for (i = 3; i >= 0; i--) bytes.push((lo >>> (i * 8)) & 0xFF);
+    var h = [0x67452301, 0xEFCDAB89, 0x98BADCFE, 0x10325476, 0xC3D2E1F0], w = new Array(80);
+    function rol(x, n) { return (x << n) | (x >>> (32 - n)); }
+    for (var off = 0; off < bytes.length; off += 64) {
+      for (t = 0; t < 16; t++) w[t] = (bytes[off + 4 * t] << 24) | (bytes[off + 4 * t + 1] << 16) | (bytes[off + 4 * t + 2] << 8) | bytes[off + 4 * t + 3];
+      for (t = 16; t < 80; t++) w[t] = rol(w[t - 3] ^ w[t - 8] ^ w[t - 14] ^ w[t - 16], 1);
+      var a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f, k;
+      for (t = 0; t < 80; t++) {
+        if (t < 20) { f = (b & c) | ((~b) & d); k = 0x5A827999; }
+        else if (t < 40) { f = b ^ c ^ d; k = 0x6ED9EBA1; }
+        else if (t < 60) { f = (b & c) | (b & d) | (c & d); k = 0x8F1BBCDC; }
+        else { f = b ^ c ^ d; k = 0xCA62C1D6; }
+        var tmp = (rol(a, 5) + f + e + k + w[t]) | 0;
+        e = d; d = c; c = rol(b, 30); b = a; a = tmp;
+      }
+      h[0] = (h[0] + a) | 0; h[1] = (h[1] + b) | 0; h[2] = (h[2] + c) | 0; h[3] = (h[3] + d) | 0; h[4] = (h[4] + e) | 0;
+    }
+    var out = [];
+    for (i = 0; i < 5; i++) { out.push((h[i] >>> 24) & 0xFF, (h[i] >>> 16) & 0xFF, (h[i] >>> 8) & 0xFF, h[i] & 0xFF); }
+    return out;
+  }
+
+  var SHA256K = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+  function sha256Bytes(msg) {
+    var bytes = msg.slice(), ml = bytes.length, i, t;
+    bytes.push(0x80);
+    while (bytes.length % 64 !== 56) bytes.push(0);
+    var hi = Math.floor(ml / 0x20000000), lo = (ml * 8) >>> 0;
+    for (i = 3; i >= 0; i--) bytes.push((hi >>> (i * 8)) & 0xFF);
+    for (i = 3; i >= 0; i--) bytes.push((lo >>> (i * 8)) & 0xFF);
+    var h = [0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19], w = new Array(64);
+    function rr(v, a) { return (v >>> a) | (v << (32 - a)); }
+    for (var off = 0; off < bytes.length; off += 64) {
+      for (t = 0; t < 16; t++) w[t] = (bytes[off + 4 * t] << 24) | (bytes[off + 4 * t + 1] << 16) | (bytes[off + 4 * t + 2] << 8) | bytes[off + 4 * t + 3];
+      for (t = 16; t < 64; t++) {
+        var s0 = rr(w[t - 15], 7) ^ rr(w[t - 15], 18) ^ (w[t - 15] >>> 3);
+        var s1 = rr(w[t - 2], 17) ^ rr(w[t - 2], 19) ^ (w[t - 2] >>> 10);
+        w[t] = (w[t - 16] + s0 + w[t - 7] + s1) | 0;
+      }
+      var a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+      for (t = 0; t < 64; t++) {
+        var S1 = rr(e, 6) ^ rr(e, 11) ^ rr(e, 25);
+        var ch = (e & f) ^ ((~e) & g);
+        var t1 = (hh + S1 + ch + SHA256K[t] + w[t]) | 0;
+        var S0 = rr(a, 2) ^ rr(a, 13) ^ rr(a, 22);
+        var mj = (a & b) ^ (a & c) ^ (b & c);
+        var t2 = (S0 + mj) | 0;
+        hh = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+      }
+      h[0] = (h[0] + a) | 0; h[1] = (h[1] + b) | 0; h[2] = (h[2] + c) | 0; h[3] = (h[3] + d) | 0;
+      h[4] = (h[4] + e) | 0; h[5] = (h[5] + f) | 0; h[6] = (h[6] + g) | 0; h[7] = (h[7] + hh) | 0;
+    }
+    var out = [];
+    for (i = 0; i < 8; i++) { out.push((h[i] >>> 24) & 0xFF, (h[i] >>> 16) & 0xFF, (h[i] >>> 8) & 0xFF, h[i] & 0xFF); }
+    return out;
+  }
+  function md5BytesOf(bytes) { return hexToBytesArr(MD5(bytesToLatin1(bytes))); }
+  function hmacBytes(hashFn, msgBytes, keyBytes) {
+    var k = keyBytes.slice();
+    if (k.length > 64) k = hashFn(k);
+    while (k.length < 64) k.push(0);
+    var ip = [], op = [], i;
+    for (i = 0; i < 64; i++) { ip.push(k[i] ^ 0x36); op.push(k[i] ^ 0x5C); }
+    return hashFn(op.concat(hashFn(ip.concat(msgBytes))));
+  }
+  function cjAesArgs(key, cfg) {
+    var kw = waCreate(key);
+    var keyStr = CJ.enc.Latin1.stringify(kw);
+    var ivStr = (cfg && cfg.iv) ? CJ.enc.Latin1.stringify(waCreate(cfg.iv)) : '';
+    var mode = (cfg && cfg.mode && cfg.mode.name === 'ECB') ? 'ECB' : '';
+    return [keyStr, ivStr, mode, kw];
+  }
+
+  var CJ = {
+    lib: { WordArray: { create: waCreate } },
+    enc: {
+      Hex: {
+        stringify: function (w) { return bytesToHex(bytesFromWA(w)); },
+        parse: function (s) { return waFromBytes(hexToBytesArr(s)); }
+      },
+      Utf8: {
+        stringify: function (w) { return utf8Decode(bytesToLatin1(bytesFromWA(w))); },
+        parse: function (s) { return waFromBytes(latin1ToBytes(utf8Encode(s))); }
+      },
+      Latin1: {
+        stringify: function (w) { return bytesToLatin1(bytesFromWA(w)); },
+        parse: function (s) { return waFromBytes(latin1ToBytes(s)); }
+      },
+      Base64: {
+        stringify: function (w) { return rawB64eBytes(bytesFromWA(w)); },
+        parse: function (s) { return waFromBytes(rawB64dBytes(s)); }
+      }
+    },
+    MD5: function (x) { return waFromBytes(md5BytesOf(bytesFromWA(waCreate(x)))); },
+    SHA1: function (x) { return waFromBytes(sha1Bytes(bytesFromWA(waCreate(x)))); },
+    SHA256: function (x) { return waFromBytes(sha256Bytes(bytesFromWA(waCreate(x)))); },
+    HmacMD5: function (x, k) { return waFromBytes(hmacBytes(md5BytesOf, bytesFromWA(waCreate(x)), bytesFromWA(waCreate(k)))); },
+    HmacSHA1: function (x, k) { return waFromBytes(hmacBytes(sha1Bytes, bytesFromWA(waCreate(x)), bytesFromWA(waCreate(k)))); },
+    HmacSHA256: function (x, k) { return waFromBytes(hmacBytes(sha256Bytes, bytesFromWA(waCreate(x)), bytesFromWA(waCreate(k)))); },
+    mode: { CBC: { name: 'CBC' }, ECB: { name: 'ECB' }, CFB: { name: 'CFB' }, OFB: { name: 'OFB' }, CTR: { name: 'CTR' } },
+    pad: { Pkcs7: { name: 'Pkcs7' }, NoPadding: { name: 'NoPadding' }, ZeroPadding: { name: 'ZeroPadding' }, AnsiX923: { name: 'AnsiX923' }, Iso10126: { name: 'Iso10126' } },
+    AES: {
+      encrypt: function (plain, key, cfg) {
+        var a = cjAesArgs(key, cfg || {});
+        var text = CJ.enc.Utf8.stringify(waCreate(plain));
+        var res = bridgeCall('aesEncode', [text, a[0], a[1], a[2]]);
+        var wa = res ? CJ.enc.Base64.parse(res) : new WA([], 0);
+        wa.ciphertext = wa;
+        wa.toString = function () { return res || ''; };
+        return wa;
+      },
+      decrypt: function (data, key, cfg) {
+        var a = cjAesArgs(key, cfg || {});
+        var b64 = (typeof data === 'string') ? data
+          : (data && data.ciphertext ? CJ.enc.Base64.stringify(waCreate(data.ciphertext)) : str(data));
+        var res = bridgeCall('aesDecode', [b64, a[0], a[1], a[2]]);
+        return CJ.enc.Utf8.parse(res || '');
+      }
+    }
+  };
+  HK.cryptoObject = CJ;
+  HK.getCryptoJSSource = function () { return 'var CryptoJS = HikerEngine.cryptoObject;'; };
+
+  /* ---------- fetch 语义 [A-P0-4/P0-5] ----------
+   * 缺省返回正文串；withHeaders/withStatusCode 时按官方 wrapFetch 形返回
+   * JSON 串 {body,headers,url,statusCode,error}；onlyHeaders 时 body=null。
+   * 走桥契约 fetchFull（Java 侧与 HikerHttp 共用 HikerCookies，cookie 自动带/存，
+   * timeout 由 options 透传）；fetchFull 不可用时降级正文 + 空头并留痕。 */
+  function fetchFull(url, o) {
+    var r = bridgeCall('fetchFull', [url, JSON.stringify(o || {})]);
+    if (r === null) return null;
+    var f = jparse(r, null);
+    if (!f || typeof f !== 'object' || typeof f.body !== 'string') return null;
+    return f;
+  }
+  function fetchImpl(u, o) {
+    var url = trim(u);
+    o = (typeof o === 'string') ? (jparse(o, {}) || {}) : (o || {});
+    if (!url) return '';
+    var wantWrap = !!(o.withHeaders || o.withStatusCode || o.onlyHeaders);
+    if (!wantWrap) return hkFetch(url, o);
+    var full = fetchFull(url, o);
+    if (!full) {
+      emit('hk.log', 'fetchFull 不可用，withHeaders 降级为空头包装: ' + url);
+      return JSON.stringify({ body: o.onlyHeaders ? null : hkFetch(url, o), headers: {}, url: url, statusCode: 0, error: 'fetchFull-unavailable' });
+    }
+    return JSON.stringify({
+      body: o.onlyHeaders ? null : full.body,
+      headers: full.headers || {},
+      url: url,
+      statusCode: (typeof full.status === 'number') ? full.status : 0,
+      error: null
+    });
+  }
+  HK.fetchImpl = fetchImpl;
+
+  /* ---------- 播放目标解析 [A-P0-7] ----------
+   * 地址尾段：#标记# 收集为 flag；;{K@V&&K2@V2} 拆为 headers 对象。 */
+  function parsePlayTarget(raw, extra) {
+    var u = str(raw), flags = [], headers = {}, m;
+    var hm = /;\{([\s\S]*)\}\s*$/.exec(u);
+    if (hm) {
+      var pairs = hm[1].split('&&');
+      for (var i = 0; i < pairs.length; i++) {
+        var kv = pairs[i].split('@');
+        if (kv.length >= 2) headers[str(kv[0]).replace(/^\s+|\s+$/g, '')] = kv.slice(1).join('@');
+      }
+      u = u.slice(0, hm.index);
+    }
+    u = u.replace(/#([^#]*)#/g, function (mm, seg) { if (seg) flags.push(seg); return ''; });
+    if (extra && extra.headers) {
+      var eh = extra.headers;
+      if (typeof eh === 'string') { var pr = eh.split('&&'); for (var j = 0; j < pr.length; j++) { var kv2 = pr[j].split('@'); if (kv2.length >= 2) headers[kv2[0]] = kv2.slice(1).join('@'); } }
+      else if (typeof eh === 'object') for (var k in eh) if (has(eh, k)) headers[k] = str(eh[k]);
+    }
+    return { url: u.replace(/^\s+|\s+$/g, ''), headers: headers, flag: flags.join('#') };
+  }
+  HK.parsePlayTarget = parsePlayTarget;
+
+  /* 全局补齐（UI boot 调用一次）：先让 api_surface 按契约填全局缺口
+   * （delegate 优先——已存在的真实现不覆盖），再由 engine 盖上自己的
+   * CryptoJS / getCryptoJS / joinUrl / getResCode 真实现；
+   * 最后装 scheme 分发包装全局 fetch（hiker:// 内部地址不走网络）。 */
+  HK.installGlobals = function () {
+    try {
+      if (global.HikerApiSurface && typeof global.HikerApiSurface.install === 'function') {
+        global.HikerApiSurface.install(global, { network: true });
+      }
+    } catch (e) {}
+    global.CryptoJS = CJ;
+    global.getCryptoJS = HK.getCryptoJSSource;
+    global.getCryptoJS2 = HK.getCryptoJSSource;
+    if (typeof global.joinUrl !== 'function') global.joinUrl = joinUrl;
+    if (typeof global.getResCode !== 'function') global.getResCode = HK.getResCode;
+    if (typeof global.setResCode !== 'function') global.setResCode = HK.setResCode;
+    try {
+      if (global.HikerScheme && typeof global.HikerScheme.install === 'function') {
+        global.HikerScheme.install({ allowLocal: true });
+      }
+    } catch (e) {}
+    return true;
+  };
+
   /* 建一个作用域：所有规则/模块代码都在这里面跑 */
   function makeScope(extra) {
     var sc = {};
@@ -426,13 +841,28 @@
     sc.hexToBase64 = function (h) { return b64e(String.fromCharCode.apply(null, sc.hexToBytes(h))); };
     sc.strToBase64 = sc.base64Encode;
 
-    /* 网络（同步） */
-    sc.fetch = function (u, o) { return hkFetch(u, o); };
-    sc.request = function (u, o) { return hkFetch(u, o); };
+    /* 网络（同步）[A-P0-5]：走 fetchImpl，withHeaders/onlyHeaders/withStatusCode
+     * 返回官方 wrapFetch 包装串；fetchPC/postPC 强制 PC UA；timeout 透传到桥。 */
+    sc.fetch = function (u, o) { return fetchImpl(u, o); };
+    sc.request = function (u, o) { return fetchImpl(u, o); };
     sc.fetchSync = sc.fetch;
     sc.post = function (u, body, o) {
-      o = o || {}; o.method = 'POST'; o.body = body;
-      return reqSync(u, o);
+      o = o || {}; o.method = 'POST';
+      o.body = (body !== null && typeof body === 'object') ? JSON.stringify(body) : body;
+      return fetchImpl(u, o);
+    };
+    sc.fetchPC = function (u, o) {
+      o = (typeof o === 'string') ? (jparse(o, {}) || {}) : (o || {});
+      o.headers = o.headers || {};
+      if (!o.headers['User-Agent'] && !o.headers['user-agent']) o.headers['User-Agent'] = UAP;
+      return fetchImpl(u, o);
+    };
+    sc.postPC = function (u, body, o) {
+      o = o || {}; o.method = 'POST';
+      o.body = (body !== null && typeof body === 'object') ? JSON.stringify(body) : body;
+      o.headers = o.headers || {};
+      if (!o.headers['User-Agent'] && !o.headers['user-agent']) o.headers['User-Agent'] = UAP;
+      return fetchImpl(u, o);
     };
 
     /* DOM */
@@ -446,6 +876,12 @@
     sc.parseDomForHtml = function (h, r) { return pdfh(h, r); };
     sc.parseDom = function (h, r) { return pdfh(h, r); };
     sc.parseDomForArray = function (h, r) { return pdfa(h, r); };
+    /* [A-P1-7] _pd 系列别名（参考 HkJsRuntime:1104-1119，规则有 var pdfa=_pdfa 式转发） */
+    sc._pd = function (h, r) { return pdfh(h, r); };
+    sc._pdfh = function (h, r) { return pdfh(h, r); };
+    sc._pdfa = function (h, r) { return pdfa(h, r); };
+    sc._pdfl = function (h, r) { return pdfh(h, r); };
+    sc.joinUrl = function (b, r) { return joinUrl(b || str(PAGE.url || ''), r); };
 
     /* 结果输出 */
     function setResult(v) { OUT.result = v; OUT.hasResult = true; return v; }
@@ -477,32 +913,58 @@
       }
       return rule || {};
     };
-    /* [P6] toast() 直接弹原生（HikerBridge.toast 由本轮 Java 侧新增） */
-    sc.toast = function (m) {
-      if (bridge && typeof bridge.toast === 'function') { try { bridge.toast(str(m)); } catch (e) {} }
-      else emit('hk.toast', str(m));
-    };
     sc.setHomeResult = setResult;
     sc.setSearchResult = setResult;
     sc.setStrResult = setResult;
     sc.setLastChapterResult = setResult;
     sc.nsetHomeResult = setResult;
+    /* [A-P1-7] setPreResult：预结果，setResult 未调用时作最终结果（run 收尾处理） */
+    sc.setPreResult = function (v) { OUT.preResult = v; return v; };
+    /* [A-P1-7] setLastChapterRule：原来只有 setLastChapterResult，差一位即报错 */
+    sc.setLastChapterRule = function (r) { HK.lastChapterRule = r; return true; };
+    sc.nsetLastChapterRule = sc.setLastChapterRule;
+    /* [A-P0-12] 预取正文通道 */
+    sc.getResCode = function () { return HK.resCode || ''; };
+    sc.setResCode = function (v) { HK.resCode = str(v); return HK.resCode; };
+    sc.getCode = sc.getResCode;
+    /* [A-P0-3] CryptoJS：作用域直给真对象；getCryptoJS 按官方返回源码串，
+     * eval(getCryptoJS()) 后 CryptoJS 指向同一对象 */
+    sc.CryptoJS = CJ;
+    sc.getCryptoJS = function () { return HK.getCryptoJSSource(); };
+    sc.getCryptoJS2 = sc.getCryptoJS;
+    /* [A-P0-8] __hkSelectExec 兜底：UI 点击层会优先拦截弹页面内选择层；
+     * 若链接在规则内部被直接执行，走 prompt 真选择后执行回调。 */
+    sc.__hkSelectExec = function (id) {
+      var e = global.__HK_SELECTS__ && global.__HK_SELECTS__[id];
+      if (!e) return '';
+      var v = pickOption(e.options, e.def, e.title);
+      if (v === null) return '';
+      var fn = eval('(' + e.fn + ')');
+      return fn(v);
+    };
 
-    /* 变量 */
+    /* 变量（[A-P1-3] 全部落 localStorage 持久化，put/clear 后即存） */
     sc.getVar = function (k, d) { return has(STORE.vars, str(k)) ? STORE.vars[str(k)] : (d === undefined ? '' : d); };
-    sc.putVar = function (k, v) { STORE.vars[str(k)] = v; return v; };
-    sc.clearVar = function (k) { if (k === undefined) STORE.vars = {}; else delete STORE.vars[str(k)]; return true; };
+    sc.putVar = function (k, v) { STORE.vars[str(k)] = v; persistSave(); return v; };
+    sc.putVar2 = sc.putVar;
+    sc.clearVar = function (k) { if (k === undefined) STORE.vars = {}; else delete STORE.vars[str(k)]; persistSave(); return true; };
     sc.getMyVar = function (k, d, r) { var q = myKey(k, r); return has(STORE.myVars, q) ? STORE.myVars[q] : (d === undefined ? '' : d); };
-    sc.putMyVar = function (k, v, r) { STORE.myVars[myKey(k, r)] = v; return v; };
-    sc.clearMyVar = function (k, r) { delete STORE.myVars[myKey(k, r)]; return true; };
+    sc.putMyVar = function (k, v, r) { STORE.myVars[myKey(k, r)] = v; persistSave(); return v; };
+    sc.clearMyVar = function (k, r) { delete STORE.myVars[myKey(k, r)]; persistSave(); return true; };
     sc.listMyVarKeys = function (r) {
       var pre = (r || ruleName) + '@', out = [];
       for (var q in STORE.myVars) if (has(STORE.myVars, q) && q.indexOf(pre) === 0) out.push(q.slice(pre.length));
       return out;
     };
-    sc.getItem = function (k, d) { return has(STORE.items, str(k)) ? STORE.items[str(k)] : (d === undefined ? '' : d); };
-    sc.setItem = function (k, v) { STORE.items[str(k)] = v; return v; };
-    sc.clearItem = function (k) { if (k === undefined) STORE.items = {}; else delete STORE.items[str(k)]; return true; };
+    /* [A-P1-3] getItem/setItem 改走持久 KV（按规则名隔离），不再与页面条目
+     * 注册表 STORE.items 混用——后者只服务 findItem/updateItem 的渲染条目。 */
+    sc.getItem = function (k, d) { var q = myKey(k); return has(STORE.kv, q) ? STORE.kv[q] : (d === undefined ? '' : d); };
+    sc.setItem = function (k, v) { STORE.kv[myKey(k)] = v; persistSave(); return v; };
+    sc.clearItem = function (k) {
+      if (k === undefined) { var pre = ruleName + '@'; for (var q in STORE.kv) if (has(STORE.kv, q) && q.indexOf(pre) === 0) delete STORE.kv[q]; }
+      else delete STORE.kv[myKey(k)];
+      persistSave(); return true;
+    };
     /* hiker 的 storage0..9：按槽位隔离的持久存储 */
     var lsKey = function (slot, k) { return 'hk_s' + slot + '_' + ruleName + '_' + str(k); };
     for (var si = 0; si < 10; si++) {
@@ -518,7 +980,20 @@
         };
       })(si);
     }
-    sc.getPublicItem = sc.getItem; sc.setPublicItem = sc.setItem; sc.clearPublicItem = sc.clearItem;
+    /* 公共 KV：不按规则隔离（跨规则共享），同样持久化 */
+    sc.getPublicItem = function (k, d) { return has(STORE.kv, 'pub@' + str(k)) ? STORE.kv['pub@' + str(k)] : (d === undefined ? '' : d); };
+    sc.setPublicItem = function (k, v) { STORE.kv['pub@' + str(k)] = v; persistSave(); return v; };
+    sc.clearPublicItem = function (k) { delete STORE.kv['pub@' + str(k)]; persistSave(); return true; };
+    /* [A-P0-4] Cookie 作用域通道：与 HikerHttp 共用 HikerCookies（桥契约），
+     * setCookie(url, cookieStr) / getCookie(url) */
+    sc.getCookie = function (u) {
+      var r = bridgeCall('getCookie', [str(u || PAGE.url || '')]);
+      return r === null ? '' : r;
+    };
+    sc.setCookie = function (u, c) {
+      var r = bridgeCall('setCookie', [str(u || ''), str(c || '')]);
+      return r !== null;
+    };
 
     /* 页面参数 */
     sc.getParam = function (k, d, u) {
@@ -542,15 +1017,20 @@
     sc.getPageTitle = function () { return str(PAGE.title || ''); };
     sc.setPageTitle = function (t) { PAGE.title = str(t); return true; };
     sc.setPagePicUrl = function (u) { PAGE.pic = str(u); return true; };
-    sc.setPageParams = function (p) { return true; };
-    sc.setPageReverse = function () { return true; };
-    sc.isPageReversed = function () { return false; };
+    sc.setPageParams = function (p) { PAGE.params = p; return true; };
+    sc.setPageReverse = function (b) { PAGE.reversed = !!b; return true; };
+    sc.isPageReversed = function () { return !!PAGE.reversed; };
     sc.refreshPage = function () { emit('hk.refresh', ''); return true; };
     sc.refreshX5Desc = function () { return true; };
     sc.refresh = sc.refreshPage;
     sc.back = function () { emit('hk.back', ''); return true; };
     sc.closeMe = function () { emit('hk.back', ''); return true; };
-    sc.toast = function (m) { emit('hk.toast', str(m)); return true; };
+    /* [A-P2-2] toast 唯一定义：原生桥 Toast + UI 事件双通道（原双定义已合并） */
+    sc.toast = function (m) {
+      if (bridge && typeof bridge.toast === 'function') { try { bridge.toast(str(m)); } catch (e) {} }
+      emit('hk.toast', str(m));
+      return true;
+    };
     sc.log = function (m) { emit('hk.log', str(m)); return true; };
     sc.nlog = sc.log;
     sc.error = function (m) { emit('hk.error', str(m)); return true; };
@@ -567,10 +1047,14 @@
     sc.getSearchMode = function () { return ''; };
     sc.setSearchMode = function () { return true; };
     sc.getRule = function (k) { var r = PAGE.rule || {}; return str(has(r, str(k)) ? r[str(k)] : ''); };
-    sc.getHome = function () { return '[]'; };
+    /* [A-P1-6] 不再恒假值：getHome 给当前规则概要，getColTypes 给真支持集 */
+    sc.getHome = function () {
+      var r = PAGE.rule || {};
+      return JSON.stringify([{ title: str(r.title || ''), url: str(r.url || ''), type: str(r.type || '') }]);
+    };
     sc.getHomeSub = function () { return '[]'; };
     sc.hasHomeSub = function () { return false; };
-    sc.getColTypes = function () { return '[]'; };
+    sc.getColTypes = function () { return JSON.stringify(HK.COL_TYPES); };
     sc.getLastRules = function () { return '[]'; };
     sc.getRuleCount = function () { return 0; };
     sc.getPrivateJS = function () { return ''; };
@@ -578,11 +1062,35 @@
     sc.getJsLazyPlugin = function () { return ''; };
     sc.addListener = function () { return true; };
 
-    /* 交互 */
-    sc.confirm = function (o) { return global.confirm ? global.confirm(str(o && o.title || o)) : ''; };
+    /* 交互 [A-P1-5]：confirm 兼容对象式 {title/content, confirm, cancel}
+     * ——confirm/cancel 为字符串时是按钮文案（走原生 confirm 返回布尔），
+     * 为函数时是回调（按结果回调并返回布尔），对齐官方语义。 */
+    sc.confirm = function (o) {
+      if (o && typeof o === 'object') {
+        var msg = str(o.title || o.content || o.message || '确认？');
+        var ok = global.confirm ? !!global.confirm(msg) : true;
+        try {
+          if (ok && typeof o.confirm === 'function') o.confirm();
+          if (!ok && typeof o.cancel === 'function') o.cancel();
+        } catch (e) {}
+        return ok;
+      }
+      return global.confirm ? !!global.confirm(str(o)) : true;
+    };
+    /* [A-P0-8] showSelectOptions：真选择（prompt 编号选），返回选中项原文；
+     * 入参可为数组或 {options/optionList, defaultIndex/selectIndex, title} */
     sc.showSelectOptions = function (o) {
-      var opts = (o && (o.options || o)) || [];
-      return isArr(opts) ? str(opts[0] || '') : '';
+      var opts = [], def = 0, ttl = '';
+      if (isArr(o)) opts = o;
+      else if (o && typeof o === 'object') {
+        opts = o.options || o.optionList || o.list || [];
+        def = (typeof o.defaultIndex === 'number') ? o.defaultIndex
+            : (typeof o.selectIndex === 'number') ? o.selectIndex
+            : (typeof o.index === 'number') ? o.index : 0;
+        ttl = str(o.title || '');
+      }
+      var v = pickOption(opts, def, ttl);
+      return v === null ? '' : str(v);
     };
     sc.copy = function (t) { emit('hk.copy', str(t)); return true; };
     sc.open = function (u) { emit('hk.open', str(u)); return true; };
@@ -617,7 +1125,13 @@
     sc.writeFile = function (p, c) { return fileWrite(p, c); };
     sc.saveFile = function (p, c) { return fileWrite(p, c); };
     sc.deleteFile = function (p) { delete STORE.files[str(p)]; return true; };
-    sc.fileExist = function (p) { return !!fileRead(p); };
+    /* [A-P1-9] fileExist 优先问桥（HikerApi.fileExist 按文件系统判存），
+     * 不再以「读到非空内容」误判空文件/二进制文件不存在 */
+    sc.fileExist = function (p) {
+      var r = bridgeCall('fileExist', [str(p)]);
+      if (r !== null) return r === 'true' || r === '1';
+      return !!fileRead(p);
+    };
     sc.getPath = function (p) { return 'hiker://files/' + str(p); };
 
     /* 播放 */
@@ -626,15 +1140,23 @@
       var list = isArr(json) ? json : (jparse(json, []) || []);
       for (var i = 0; i < list.length; i++) {
         var it = list[i] || {};
-        if (it.url) HK.play(it.url, it.title || '', it.pic || '');
+        if (it.url) HK.play(it.url, it.title || '', it.pic || '', { headers: it.headers || null, flag: it.flag || '' });
       }
       return true;
     };
 
-    /* 本页变量（海阔注入的全局） */
-    sc.MY_URL = str(PAGE.url || '');
-    sc.MY_PAGE = PAGE.page || 1;
-    sc.MY_KEYWORD = str(PAGE.keyword || '');
+    /* 本页变量（海阔注入的全局）[A-P0-9/P0-10/P0-13]
+     * 全部改成与 PAGE 绑定的 getter/setter（与 MY_RULE 同款），不再是空快照：
+     *   MY_PARAMS/params —— 页面 URL 的查询参数对象（setPageParams 可覆盖）
+     *   input            —— 本页输入（搜索词/输入框值/详情 URL，UI 经 vars 传入）
+     *   host             —— MY_URL 的主机名（非 http 时回落规则 homePage 的主机）
+     *   d                —— 全局结果集，d.push 的条目在 run 收尾并入 result */
+    function liveProp(name, get, set) {
+      Object.defineProperty(sc, name, { configurable: true, enumerable: true, get: get, set: set });
+    }
+    liveProp('MY_URL', function () { return str(PAGE.url || ''); }, function (v) { PAGE.url = str(v); });
+    liveProp('MY_PAGE', function () { return PAGE.page || 1; }, function (v) { PAGE.page = v; });
+    liveProp('MY_KEYWORD', function () { return str(PAGE.keyword || ''); }, function (v) { PAGE.keyword = str(v); });
     /* [P3] 合集框架的 hijackEnv() 会改写 MY_RULE。若这里是快照，改写后
      * 规则读到的还是旧对象 → 子站进不去。改成 getter，随 PAGE.rule 实时变。 */
     Object.defineProperty(sc, 'MY_RULE', {
@@ -642,12 +1164,16 @@
       get: function () { return PAGE.rule || {}; },
       set: function (v) { HK.setPage({ rule: v }); }
     });
-    sc.MY_TITLE = str(PAGE.title || '');
-    sc.MY_PIC = str(PAGE.pic || '');
-    sc.MY_PARAMS = '';
-    sc.params = {};
-    sc.input = '';
-    sc.host = '';
+    liveProp('MY_TITLE', function () { return str(PAGE.title || ''); }, function (v) { PAGE.title = str(v); });
+    liveProp('MY_PIC', function () { return str(PAGE.pic || ''); }, function (v) { PAGE.pic = str(v); });
+    liveProp('MY_PARAMS', function () { return PAGE.params || {}; }, function (v) { PAGE.params = v; });
+    liveProp('params', function () { return PAGE.params || {}; }, function (v) { PAGE.params = v; });
+    liveProp('input', function () { return (PAGE.input === undefined || PAGE.input === null) ? '' : PAGE.input; },
+             function (v) { PAGE.input = v; });
+    liveProp('host', function () {
+      return hostOf(PAGE.url) || hostOf((PAGE.rule || {}).url) || hostOf((PAGE.rule || {}).homePage) || '';
+    }, function () {});
+    liveProp('d', function () { return OUT.d; }, function (v) { OUT.d = isArr(v) ? v : []; });
     sc.MOBILE_UA = UAM;
     sc.PC_UA = UAP;
 
@@ -697,6 +1223,19 @@
     sc.unRegisterTask = function () { return true; };
     sc.registerDNS = function () { return true; };
     sc.startProxyServer = function () { return ''; };
+
+    /* [A-P0-2] api_surface 契约层按「缺失才填」并入作用域（delegate 优先）：
+     * engine 已有真实现的（fetch/存储/DOM/结果…）一律不覆盖；只补桥转发类
+     * （aes/rsa/batchFetch/getCookie 族/cacheM3u8/downloadFile/createQRCode…）
+     * 与 getPastes 家族等 engine 没有的名字。 */
+    try {
+      if (global.HikerApiSurface && typeof global.HikerApiSurface.build === 'function') {
+        var apiFill = global.HikerApiSurface.build({ network: true });
+        for (var an in apiFill) {
+          if (has(apiFill, an) && typeof sc[an] === 'undefined') sc[an] = apiFill[an];
+        }
+      }
+    } catch (e) {}
 
     if (extra) for (var k in extra) if (has(extra, k)) sc[k] = extra[k];
     return sc;
@@ -910,14 +1449,23 @@
     return (a.length ? src + '(' + a.join(',') + ')' : src);
   }
 
+  /* [A-P0-8] $().select 的待选登记表：$(选项, 默认序, 标题).select(回调) 生成
+   * __hkSelectExec("id") 链接，点击时 UI 按 id 取出选项弹「页面内选择层」，
+   * 用户选完再把回调以选中值执行——真选择，不静默选第一项。 */
+  HK.selectSeq = 0;
+  global.__HK_SELECTS__ = global.__HK_SELECTS__ || {};
+
   function makeDollar(modName) {
-    var d = function (x, hint) {
+    var d = function (x, hint, title3) {
       var base;
-      if (!x) base = 'hiker://empty';
+      if (!x || isArr(x)) base = 'hiker://empty';
       else if (str(x).indexOf('hiker://') === 0) base = str(x);
       else base = 'hiker://empty' + str(x);
-      d.__inputValue = str(x || '');
+      d.__inputValue = isArr(x) ? '' : str(x || '');
       d.__inputHint = str(hint || '');
+      d.__selOpts = isArr(x) ? x : null;
+      d.__selDef = (typeof hint === 'number') ? hint : 0;
+      d.__selTitle = str(title3 || (typeof hint === 'string' ? hint : '') || '');
       return {
         rule: function (fn) { return base + '#@rule=js:' + (typeof fn === 'function' ? fn.toString() : str(fn)); },
         lazyRule: function (fn) {
@@ -929,6 +1477,17 @@
           var rest = Array.prototype.slice.call(arguments, 1);
           return base + '#@input=' + encodeURIComponent(JSON.stringify({ v: str(d.__inputValue || ''), d: str(d.__inputHint || '') }))
             + '#@lazyRule=.js:' + encodeLazy(fn, rest);
+        },
+        /* [A-P0-8] $(选项数组, 默认序, 标题).select(回调) */
+        select: function (fn) {
+          var id = 's' + (++HK.selectSeq);
+          global.__HK_SELECTS__[id] = {
+            options: d.__selOpts || [],
+            def: d.__selDef || 0,
+            title: d.__selTitle || '',
+            fn: (typeof fn === 'function') ? fn.toString() : str(fn)
+          };
+          return 'hiker://empty#@lazyRule=.js:__hkSelectExec(' + JSON.stringify(id) + ')';
         },
         toString: function () { return base; }
       };
@@ -1016,6 +1575,31 @@
   /* ==================================================================== *
    * 7. 规则执行
    * ==================================================================== */
+  /* [A-P0-9] vars 先同步进 PAGE（MY_URL→url、MY_PAGE→page、input、MY_PARAMS），
+   * 作用域的 live getter 才能读到真实值；URL 带查询串时自动解析为 params。 */
+  function applyVarsToPage(v) {
+    if (!v) return;
+    if (v.MY_URL !== undefined) PAGE.url = str(v.MY_URL);
+    if (v.MY_KEYWORD !== undefined) PAGE.keyword = str(v.MY_KEYWORD);
+    if (v.MY_PAGE !== undefined) PAGE.page = v.MY_PAGE;
+    if (v.MY_TITLE !== undefined) PAGE.title = str(v.MY_TITLE);
+    if (v.MY_PIC !== undefined) PAGE.pic = str(v.MY_PIC);
+    if (v.input !== undefined) PAGE.input = v.input;
+    var prm = (v.MY_PARAMS !== undefined) ? v.MY_PARAMS : v.params;
+    if (prm !== undefined) PAGE.params = prm;
+    else if (typeof v.MY_URL === 'string' && v.MY_URL.indexOf('?') >= 0) {
+      var q = parseQuery(v.MY_URL);
+      if (Object.keys(q).length) PAGE.params = q;
+    }
+  }
+  HK.applyVarsToPage = applyVarsToPage;
+
+  /* [A-P0-13] 收尾并入：d.push 的结果集 / setPreResult 在没有 setResult 时作结果 */
+  function finishResult() {
+    if (!OUT.hasResult && OUT.d && OUT.d.length) { OUT.result = OUT.d; OUT.hasResult = true; }
+    if (!OUT.hasResult && OUT.preResult !== undefined) { OUT.result = OUT.preResult; OUT.hasResult = true; }
+  }
+
   /**
    * 执行一段规则代码。返回 { ok, result, err }。
    * extraVars 会覆盖作用域里的变量（MY_URL / input / MY_KEYWORD…）。
@@ -1026,12 +1610,14 @@
      * 当成「label js:」侥幸跑通，掩盖问题。 */
     var src = str(code).replace(/^\s*js:/, '');
     if (!trim(src)) return { ok: false, err: '规则为空', result: undefined };
+    applyVarsToPage(extraVars);
     var sc = makeScope();
     if (extraVars) for (var k in extraVars) if (has(extraVars, k)) sc[k] = extraVars[k];
     /* input 与 MY_URL 等同步到作用域 */
     try {
       var fn = new Function('__scope', 'with(__scope){\n' + src + '\n}');
       fn.call({}, sc);
+      finishResult();
       return { ok: true, result: OUT.result, err: '' };
     } catch (e) {
       return { ok: false, err: (e && e.name ? e.name + ': ' : '') + str(e && e.message || e), result: undefined };
@@ -1043,16 +1629,19 @@
   function runInline(code, extraVars) {
     var src = str(code).replace(/^\s*js:/, '');
     if (!trim(src)) return { ok: false, err: '空规则' };
+    applyVarsToPage(extraVars);
     var sc = makeScope();
     if (extraVars) for (var k in extraVars) if (has(extraVars, k)) sc[k] = extraVars[k];
     try {
       var fn = new Function('__scope', 'with(__scope){\nreturn (' + src + '\n);}');
       var v = fn.call({}, sc);
+      finishResult();
       return { ok: true, value: v, result: OUT.result };
     } catch (e1) {
       try {
         var fn2 = new Function('__scope', 'with(__scope){\n' + src + '\n}');
         fn2.call({}, sc);
+        finishResult();
         return { ok: true, value: OUT.result, result: OUT.result };
       } catch (e2) {
         return { ok: false, err: (e2 && e2.name ? e2.name + ': ' : '') + str(e2 && e2.message || e2) };
@@ -1061,12 +1650,18 @@
   }
   HK.runInline = runInline;
 
-  /* 播放：走宿主 */
-  HK.play = function (url, title, pic) {
-    var u = str(url).replace(/#[^#]*#/g, '').trim();
+  /* 播放：走宿主 [A-P0-7]
+   * 契约：bridge.play(url,title,pic) 投递宿主播放器 + report('play', JSON)
+   * 带 {url,title,pic,headers,flag}，headers 来自地址尾 ;{K@V&&…} 或 extra，
+   * #标记# 段收进 flag，不再直接剥掉丢弃。 */
+  HK.play = function (url, title, pic, extra) {
+    var t = parsePlayTarget(url, extra);
+    var u = t.url;
     if (!u) return false;
+    var payload = { url: u, title: str(title || ''), pic: str(pic || ''), headers: t.headers, flag: str((extra && extra.flag) || t.flag || '') };
+    emit('play', payload);
     if (bridge && typeof bridge.play === 'function') {
-      try { return !!bridge.play(u, str(title), str(pic)); } catch (e) { return false; }
+      try { return !!bridge.play(u, payload.title, payload.pic); } catch (e) { return false; }
     }
     emit('hk.play', u);
     return true;

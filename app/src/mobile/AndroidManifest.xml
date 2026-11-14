@@ -17,6 +17,14 @@
 
     <application>
 
+        <!-- 海阔：手机版跟随用户方向（覆盖 main 的 unspecified，根治启动切横屏）。
+             按 Manifest 合并规则以完整节点重声明同一 activity，属性与 main 合并。 -->
+        <activity
+            android:name=".hiker.HikerActivity"
+            android:configChanges="screenSize|smallestScreenSize|screenLayout|orientation"
+            android:exported="false"
+            android:screenOrientation="fullUser" />
+
         <activity
             android:name=".ui.activity.HomeActivity"
             android:configChanges="screenSize|smallestScreenSize|screenLayout|orientation"

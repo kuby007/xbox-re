@@ -2,14 +2,20 @@ package com.fongmi.android.tv.hiker;
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.content.Intent;
+import android.net.Uri;
 import android.os.Bundle;
 import android.view.ViewGroup;
 import android.webkit.JsPromptResult;
+import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
 import android.widget.FrameLayout;
+
+import java.util.HashMap;
+import java.util.Map;
 
 /**
  * 海阔独立运行时容器 —— 与首页完全隔离。
@@ -27,22 +33,27 @@ import android.widget.FrameLayout;
  */
 public class HikerActivity extends Activity {
 
+    private static final int REQUEST_FILE_CHOOSER = 0x4846;   /* "HF" */
+
     private WebView webView;
     private HikerBridge bridge;
+    private ValueCallback<Uri[]> filePathCallback;
 
     @Override
     @SuppressLint({"SetJavaScriptEnabled", "AddJavascriptInterface"})
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        // 方向在运行时修正：绝不改 AndroidManifest（改了会让手机版装不上，见 B2 诊断）。
-        // main 的 sensorLandscape 是 TV 默认值；手机非 leanback 设备改回跟随用户方向，
-        // TV 设备（FEATURE_LEANBACK）保持原横屏不变。
-        if (!getPackageManager().hasSystemFeature(
-                android.content.pm.PackageManager.FEATURE_LEANBACK)) {
-            setRequestedOrientation(
-                    android.content.pm.ActivityInfo.SCREEN_ORIENTATION_FULL_USER);
-        }
+        // 横屏 bug 修复（HIKER-FULL）：方向已按 flavor 在 Manifest 分开声明 ——
+        // main 改 unspecified（不再写死 sensorLandscape 让手机一进海阔先横屏）、
+        // mobile 重声明 fullUser、leanback 重声明 sensorLandscape。
+        // 这里保留运行时兜底：Manifest 合并结果万一仍偏离预期，leanback 设备请求
+        // 横屏、其余设备跟随用户方向，与原补丁的最终效果一致，只是不再「先横后正」。
+        boolean leanback = getPackageManager().hasSystemFeature(
+                android.content.pm.PackageManager.FEATURE_LEANBACK);
+        setRequestedOrientation(leanback
+                ? android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE
+                : android.content.pm.ActivityInfo.SCREEN_ORIENTATION_FULL_USER);
 
         FrameLayout root = new FrameLayout(this);
         root.setBackgroundColor(0xFF101014);   // 与 App 的 Material3 深色背景一致
@@ -93,6 +104,37 @@ public class HikerActivity extends Activity {
          * 规则里的「输入框」条目（$(默认值, 提示).input(回调)）和搜索都会点不动。
          * 这里补一个原生输入框。 */
         webView.setWebChromeClient(new WebChromeClient() {
+            /* 文件选择兜底：JS 的 <input type="file">（.hkzip/.json 导入入口）
+             * 没有它点了一律无反应。用系统单选选择器（* /*），结果经
+             * filePathCallback 回传 WebView，结果处理在 onActivityResult。 */
+            @Override
+            public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> callback,
+                                             FileChooserParams params) {
+                if (filePathCallback != null) {
+                    filePathCallback.onReceiveValue(null);
+                    filePathCallback = null;
+                }
+                filePathCallback = callback;
+                try {
+                    Intent intent = new Intent(Intent.ACTION_GET_CONTENT);
+                    intent.addCategory(Intent.CATEGORY_OPENABLE);
+                    intent.setType("*/*");
+                    String[] accepts = null;
+                    try { accepts = params.getAcceptTypes(); } catch (Throwable ignored) {}
+                    if (accepts != null && accepts.length == 1 && accepts[0] != null
+                            && accepts[0].length() > 0 && !"*/*".equals(accepts[0])) {
+                        intent.setType(accepts[0]);
+                    }
+                    startActivityForResult(intent, REQUEST_FILE_CHOOSER);
+                } catch (Throwable t) {
+                    if (filePathCallback != null) {
+                        filePathCallback.onReceiveValue(null);
+                        filePathCallback = null;
+                    }
+                }
+                return true;
+            }
+
             @Override
             public boolean onJsPrompt(WebView view, String url, String message,
                                       String defaultValue, final JsPromptResult result) {
@@ -114,9 +156,57 @@ public class HikerActivity extends Activity {
         webView.loadUrl(HikerEntry.ASSET_URL);
     }
 
-    /** 桥事件回传（结果、播放、日志）；当前仅做日志，后续可接宿主 EventBus / 播放器。 */
+    /** 文件选择结果回传 WebView（onShowFileChooser 的另一半）。 */
+    @Override
+    protected void onActivityResult(int requestCode, int resultCode, Intent data) {
+        super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode != REQUEST_FILE_CHOOSER) return;
+        if (filePathCallback == null) return;
+        Uri[] results = null;
+        if (resultCode == RESULT_OK && data != null && data.getData() != null) {
+            results = new Uri[]{data.getData()};
+        }
+        filePathCallback.onReceiveValue(results);
+        filePathCallback = null;
+    }
+
+    /**
+     * 桥事件回传。播放事件按 HIKER-FULL 契约处理：
+     *   - JS 调 bridge.report("play", JSON{url,title,pic,headers,flag})（type 亦兼容
+     *     HikerContract.EV_PLAY = "hiker.play"）且 payload 为 JSON 时，解析后经
+     *     HikerBridge.pushRich 投递；宿主 PUSH 链只接受单个 URL 字符串（见 pushRich
+     *     注释），title/pic/headers/flag 如实留痕、无法透传。与 bridge.play 的同 URL
+     *     二次投递在 HikerBridge 内去重（5 秒窗口）。
+     *   - 纯字符串 payload（bridge.play 已投递的回执）保持旧行为：仅日志。
+     * 其余事件同样仅做日志，不调用首页任何类，避免与首页生命周期耦合。
+     */
     public void onBridgeEvent(String type, String payload) {
-        // 刻意不调用首页任何类；保留扩展点，避免与首页生命周期耦合。
+        if (("play".equals(type) || HikerContract.EV_PLAY.equals(type))
+                && payload != null && payload.trim().startsWith("{")) {
+            try {
+                Object parsed = HikerJson.parse(payload);
+                if (parsed instanceof Map) {
+                    @SuppressWarnings("unchecked")
+                    Map<String, Object> m = (Map<String, Object>) parsed;
+                    String url = HikerJson.str(m.get("url"));
+                    if (url.length() > 0 && bridge != null) {
+                        Map<String, String> headers = new HashMap<>();
+                        Object h = m.get("headers");
+                        if (h instanceof Map) {
+                            @SuppressWarnings("unchecked")
+                            Map<String, Object> hm = (Map<String, Object>) h;
+                            for (Map.Entry<String, Object> e : hm.entrySet())
+                                headers.put(e.getKey(), HikerJson.str(e.getValue()));
+                        }
+                        bridge.pushRich(url, HikerJson.str(m.get("title")),
+                                HikerJson.str(m.get("pic")), headers,
+                                HikerJson.str(m.get("flag")));
+                        return;
+                    }
+                }
+            } catch (Throwable ignored) {
+            }
+        }
         android.util.Log.d("HikerBridge", type + ": "
                 + (payload == null ? "" : payload.substring(0, Math.min(160, payload.length()))));
     }
@@ -155,6 +245,10 @@ public class HikerActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        if (filePathCallback != null) {
+            filePathCallback.onReceiveValue(null);
+            filePathCallback = null;
+        }
         if (webView != null) {
             webView.loadUrl("about:blank");
             webView.destroy();

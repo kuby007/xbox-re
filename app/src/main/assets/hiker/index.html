@@ -120,6 +120,45 @@ textarea:focus{border-color:var(--acc)}
   border:2px solid var(--line);border-top-color:var(--acc);animation:spin .8s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 #diagLog{display:none}
+
+/* [A] 按钮组单行横滑：分类 chips / flex_button / text_4 / text_5 / 详情页
+ * 线路选集等一律一行排布、横向滚动查看全部操作，不再多行折行 */
+.hscroll{display:flex;flex-wrap:nowrap;overflow-x:auto;gap:8px;padding:2px 0 10px;
+  -webkit-overflow-scrolling:touch;scrollbar-width:none}
+.hscroll::-webkit-scrollbar{display:none}
+.hscroll .chip{flex:none;margin:0;white-space:nowrap;display:inline-flex;align-items:center;gap:6px}
+.chip.on{background:var(--acc);border-color:var(--acc);color:#fff}
+.chip-ic{width:16px;height:16px;border-radius:4px;object-fit:cover}
+.more-btn{display:block;width:100%;margin:6px 0 18px;background:var(--card2);color:var(--txt)}
+
+/* [A] col_type 补齐渲染：间隔块 / 左图行 / 头像 / 跑马灯 / 方图 / 行内小图标 */
+.spacer{width:100%}
+.spacer.s1{height:10px}
+.spacer.s2{height:22px}
+.spacer.s3{height:38px}
+.media-row{display:flex;gap:12px;align-items:center;background:var(--card);border:1px solid var(--line);
+  border-radius:12px;padding:10px 12px;margin-bottom:8px;cursor:pointer}
+.media-row:active{background:var(--card2)}
+.mr-pic{width:52px;height:52px;flex:none;border-radius:9px;background:var(--card2);overflow:hidden;
+  display:flex;align-items:center;justify-content:center;color:var(--dim);font-size:18px;font-weight:700}
+.mr-pic.round{border-radius:50%}
+.mr-pic img{width:100%;height:100%;object-fit:cover}
+.mr-tx{min-width:0}
+.mr-tx b{display:block;font-size:14px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.mr-tx span{display:block;font-size:12px;color:var(--dim);margin-top:3px;line-height:1.5;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
+.row-ic{width:18px;height:18px;border-radius:4px;object-fit:cover;vertical-align:-4px;margin-right:8px}
+.poster .ph.sq{aspect-ratio:1/1}
+.marquee{overflow:hidden;white-space:nowrap;background:var(--card);border:1px solid var(--line);
+  border-radius:11px;padding:10px 0;margin-bottom:8px;color:var(--sub);font-size:13px}
+.marquee span{display:inline-block;padding-left:100%;animation:mq 14s linear infinite}
+@keyframes mq{to{transform:translateX(-100%)}}
+.rich.plain{white-space:pre-wrap}
+
+/* [A] 导入弹层：密码框与文件行；选择弹层：选项纵列单选 */
+.sheet input.f{display:block;width:100%;box-sizing:border-box;margin-top:10px;flex:none}
+.sel-list{display:flex;flex-direction:column;gap:8px;max-height:52vh;overflow-y:auto}
+.sel-list .chip{margin:0;text-align:left;border-radius:11px;padding:12px 14px;font-size:14px;color:var(--txt)}
 </style>
 </head>
 <body>
@@ -154,12 +193,26 @@ textarea:focus{border-color:var(--acc)}
 <div class="mask" id="importMask">
   <div class="sheet">
     <h3>导入口令</h3>
-    <p class="hint">支持：云口令（云6oooole/xxxxxx/…）、分享口令、规则 JSON、订阅地址。多条口令请一行一条。</p>
+    <p class="hint">支持：云口令（云6oooole/xxxxxx/…，带密码的在下面填密码）、分享口令、规则 JSON、订阅地址，以及 .json/.zip/.hkzip 规则文件。多条口令请一行一条。</p>
     <textarea id="importText" placeholder="把口令粘到这里"></textarea>
+    <input class="f" id="importPwd" type="password" placeholder="口令密码（没有可不填）" autocomplete="off">
     <div class="row">
       <button class="btn gh" id="clipBtn">读剪贴板</button>
+      <button class="btn gh" id="importFileBtn">选择文件</button>
       <button class="btn gh" id="importCancel">取消</button>
       <button class="btn primary" id="importOk">导入</button>
+    </div>
+    <input type="file" id="importFile" accept=".json,.zip,.hkzip,.txt" style="display:none">
+  </div>
+</div>
+
+<!-- [A-P0-8] 选择弹层：$().select 的页面内真选择 -->
+<div class="mask" id="selectMask">
+  <div class="sheet">
+    <h3 id="selectTitle">请选择</h3>
+    <div class="sel-list" id="selectList"></div>
+    <div class="row">
+      <button class="btn gh" id="selectCancel">取消</button>
     </div>
   </div>
 </div>
@@ -167,6 +220,27 @@ textarea:focus{border-color:var(--acc)}
 <div id="toast"></div>
 <div id="busy"></div>
 
+<!--
+  [A-P0-2] WebView 加载链（依赖顺序，勿调换）：
+    bridge_adapter  —— 统一 HikerBridge 入口（req/call/report/play/toast）
+    runtime_shim    —— 只「加载」不 install：它的 install 会用桩覆盖真实现；
+                       engine 只借它的 getMode/版本常量
+    api_surface     —— 契约层：engine 按「缺失才填」吸收，delegate 优先不覆盖
+    scheme          —— hiker:// 动作分发：UI boot 时经 engine.installGlobals
+                       安装到全局 fetch（拦 toast:// 等内部地址）
+    compat          —— 只加载不 install（同 shim 理由）
+    engine / import / ui
+  hiker_jst4.js 不进 WebView：它是 QuickJS 运行时专用的（会把 setTimeout
+  同步化），在 WebView 里加载会破坏所有异步。
+  hiker_app.js 不加载：它自带另一套站点模型（key/api/ext/categories），与
+  hiker_ui 的 STATE 站点模型双头并存会状态分叉，且当前无任何调用方；
+  其能力（分类/筛选/详情）已由 hiker_ui 的规则页模型覆盖。
+-->
+<script src="hiker_bridge_adapter.js"></script>
+<script src="hiker_runtime_shim.js"></script>
+<script src="hiker_api_surface.js"></script>
+<script src="hiker_scheme.js"></script>
+<script src="hiker_compat.js"></script>
 <script src="hiker_engine.js"></script>
 <script src="hiker_import.js"></script>
 <script src="hiker_ui.js"></script>
