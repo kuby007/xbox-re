@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 海阔小程序入口（新增文件，避免改动现有 strings.xml） -->
+    <string name="home_hiker">小程序</string>
+    <string name="hiker_entry_title">小程序</string>
+</resources>
