@@ -330,7 +330,12 @@
                         对齐官方 kvFile 语义；findItem/updateItem 仍走 items） */
     files: {},       /* 内存文件（未落盘时的兜底） */
     modules: {},     /* 模块缓存 ruleKey/path -> exports */
-    rawRules: {}     /* 规则原文缓存 */
+    rawRules: {},    /* 规则原文缓存 */
+    config: {},      /* [FIX2-BUG6] 全局 config 存储（initConfig 写入，落盘持久化） */
+    shared: {}       /* [FIX2-BUG7] 同规则顶层定义共享袋 ruleName -> {name: value}，
+                        只存活本会话（不落盘）：官方引擎里同页/同规则的顶层
+                        function/var 对后续 lazy 与 require 模块可见，这里靠
+                        「执行后收割声明 + 建作用域时注入」等价实现 */
   };
   HK.STORE = STORE;
 
@@ -342,6 +347,7 @@
       global.localStorage.setItem('hk_vars_v1', JSON.stringify(STORE.vars));
       global.localStorage.setItem('hk_myvars_v1', JSON.stringify(STORE.myVars));
       global.localStorage.setItem('hk_kv_v1', JSON.stringify(STORE.kv));
+      global.localStorage.setItem('hk_config_v1', JSON.stringify(STORE.config));
     } catch (e) {}
   }
   function persistLoad() {
@@ -350,6 +356,7 @@
       var v = global.localStorage.getItem('hk_vars_v1'); if (v) STORE.vars = jparse(v, {}) || {};
       var m = global.localStorage.getItem('hk_myvars_v1'); if (m) STORE.myVars = jparse(m, {}) || {};
       var k = global.localStorage.getItem('hk_kv_v1'); if (k) STORE.kv = jparse(k, {}) || {};
+      var cf = global.localStorage.getItem('hk_config_v1'); if (cf) STORE.config = jparse(cf, {}) || {};
     } catch (e) {}
   }
   persistLoad();
@@ -997,6 +1004,13 @@
 
     /* 页面参数 */
     sc.getParam = function (k, d, u) {
+      /* [FIX2-BUG4] 未显式给 URL 时先查 MY_PARAMS（条目 extra 注入的下一页
+       * 参数就落在这里），查不到再回落解析页面 URL 的查询串。官方
+       * getParam 本就读 MY_PARAMS，这里补齐这条读路径。 */
+      if (u === undefined || u === null || u === '') {
+        var pp = PAGE.params || {};
+        if (has(pp, str(k)) && pp[str(k)] !== undefined) return pp[str(k)];
+      }
       var url = str(u || PAGE.url || ''), i = url.indexOf('?');
       if (i < 0) return d === undefined ? '' : d;
       var qs = url.slice(i + 1).split('#')[0].split('&');
@@ -1237,6 +1251,28 @@
       }
     } catch (e) {}
 
+    /* [FIX2-BUG7] 注入同规则先前页面/模块收割的顶层定义（jGet、version 等），
+     * 只填作用域里还没有的名字，内置 API 与 extraVars 优先。 */
+    var sharedBag = STORE.shared[HK.ruleName() || ''];
+    if (sharedBag) {
+      for (var sgk in sharedBag) {
+        if (has(sharedBag, sgk) && typeof sc[sgk] === 'undefined') sc[sgk] = sharedBag[sgk];
+      }
+    }
+
+    /* [FIX2-BUG6] 全局 config + initConfig：聚阅 find_rule 直接读
+     * config.聚阅、preRule 调 initConfig({聚阅: 地址}) 写入。config 就是
+     * STORE.config 本体（落盘持久化），无值时读出 undefined 不报错；
+     * initConfig 按官方语义合并写入并立即落盘。 */
+    sc.config = STORE.config;
+    sc.initConfig = function (obj) {
+      if (obj && typeof obj === 'object') {
+        for (var ck in obj) if (has(obj, ck)) STORE.config[ck] = obj[ck];
+        persistSave();
+      }
+      return true;
+    };
+
     if (extra) for (var k in extra) if (has(extra, k)) sc[k] = extra[k];
     return sc;
   }
@@ -1252,6 +1288,17 @@
     lang: {
       String: function (s) { return str(s); },
       Integer: { parseInt: function (s) { return parseInt(s, 10); } },
+      /* [FIX2-BUG6] DrpyHiker 的 subpage/main.js 在倒计时循环里调
+       * java.lang.Thread.sleep(1000)；JAVA_SHIM.lang 原来没有 Thread，
+       * 读 .sleep 直接 TypeError、home 当场死。WebView 里没有真线程可睡，
+       * 用忙等做同步桩（单次上限 5s，防长睡冻死 UI 线程）。 */
+      Thread: {
+        sleep: function (ms) {
+          var end = Date.now() + Math.min(Math.max(Number(ms) || 0, 0), 5000);
+          while (Date.now() < end) {}
+          return true;
+        }
+      },
       Byte: { TYPE: 'byte' },
       reflect: {
         Array: {
@@ -1446,7 +1493,10 @@
     var src = typeof fn === 'function' ? fn.toString() : str(fn);
     var a = [];
     for (var i = 0; i < (args || []).length; i++) a.push(JSON.stringify(args[i]));
-    return (a.length ? src + '(' + a.join(',') + ')' : src);
+    /* [FIX2-BUG2] 带参时必须把函数源码整体加括号再调用：箭头函数
+     * (arg)=>{...} 直接拼 src+'(arg)' 会变成 (arg)=>{...}(arg)，
+     * SyntaxError: Unexpected token '('，选集点击必炸（CMS模板实测）。 */
+    return (a.length ? '(' + src + ')(' + a.join(',') + ')' : src);
   }
 
   /* [A-P0-8] $().select 的待选登记表：$(选项, 默认序, 标题).select(回调) 生成
@@ -1504,13 +1554,37 @@
     return d;
   }
 
+  /* [FIX2-BUG5] 在已落盘文件（STORE.files）里按 basename 找模块：
+   * 归一化（小写、去非字母数字）后比对文件主名——全等，或请求名/主名
+   * 互为前缀（HohojCore ↔ HoHoJ.js 主名 hohoj）；前缀匹配要求主名
+   * 长度 ≥3 防误命中，多个命中取主名最长者（最具体）。 */
+  function findStoredModule(name) {
+    var norm = function (s) { return str(s).toLowerCase().replace(/[^a-z0-9]/g, ''); };
+    var want = norm(name);
+    if (!want) return null;
+    var best = null, bestLen = -1;
+    for (var p in STORE.files) {
+      if (!has(STORE.files, p)) continue;
+      var base = p.split('/').pop() || '';
+      var stem = norm(base.replace(/\.[a-z0-9]+$/i, ''));
+      if (!stem) continue;
+      var hit = stem === want
+        || (stem.length >= 3 && want.indexOf(stem) === 0)
+        || (want.length >= 3 && stem.indexOf(want) === 0);
+      if (hit && stem.length > bestLen) { best = { path: p, code: STORE.files[p] }; bestLen = stem.length; }
+    }
+    return best;
+  }
+  HK.findStoredModule = findStoredModule;
+
   /**
    * 加载模块：从当前规则对象的 pages 数组里按 path 找。
    * pages 可能是 JSON 字符串，也可能是数组。
    * 模块代码执行时 $ 指向它自己的模块对象，执行完取 $.exports。
    */
   function requireModule(name, importParam) {
-    var key = str(name);
+    var origName = str(name);
+    var key = origName;
     var param = importParam === undefined ? null : importParam;
     /* hiker://page/<模块名>[?<参数>]：等价于「按名字加载 pages[] 里的模块」，
      * 参数通过 $.importParam 传给模块（阅动漫的 dataLoad / funcTools 就靠这个）。 */
@@ -1536,11 +1610,25 @@
       if (pages[i] && str(pages[i].path) === key) { page = pages[i]; break; }
     }
     if (!page) {
-      /* 远程/本地模块：name 本身是 URL 或文件路径 */
-      if (/^https?:\/\//.test(key) || /\.js$/i.test(key) || key.indexOf('hiker://') === 0) {
-        var code = /^https?:\/\//.test(key) ? reqSync(key, {}) : fileRead(key);
-        return runModule(key, code, cacheKey);
+      /* [FIX2-BUG5] 回退链（原实现用已剥 hiker://page/ 前缀的 key 做判断，
+       * page 别名永远进不了文件回退，HoHoJ 的 HohojCore 即死在这里）：
+       * (a) 原始形态：name 本身是 URL / 文件路径 / hiker://files/…，按原文加载；
+       * (b) 已落盘模块按 basename 回退：预处理把核心写到
+       *     hiker://files/rules/HoHoJ/HoHoJ.js，详情却以 page/HohojCore 引用，
+       *     按「去扩展名小写比对 + 前缀匹配」在 STORE.files 里找；
+       * (c) 规则文件目录下的同名文件（只落桥盘、内存表没有时）。 */
+      if (/^https?:\/\//.test(origName)) {
+        return runModule(origName, reqSync(origName, {}), HK.ruleName() + '::' + origName, param);
       }
+      if (/^hiker:\/\/files\//.test(origName) || /\.js$/i.test(origName)) {
+        var fc = fileRead(origName);
+        if (trim(fc)) return runModule(origName, fc, HK.ruleName() + '::' + origName, param);
+      }
+      var stored = findStoredModule(key);
+      if (stored) return runModule(key, stored.code, cacheKey, param);
+      var guess = 'hiker://files/rules/' + (HK.ruleName() || '') + '/' + key + '.js';
+      var gc = fileRead(guess);
+      if (trim(gc)) return runModule(key, gc, cacheKey, param);
       emit('hk.error', '模块不存在: ' + key);
       return null;
     }
@@ -1558,8 +1646,8 @@
     var sc = makeScope({ '$': mod$, importParam: mod$.importParam });
     var result = null;
     try {
-      var fn = new Function('__scope', 'with(__scope){\n' + src + '\n}');
-      result = fn.call({}, sc);
+      var fn = new Function('__scope', '__cap', 'with(__scope){\n' + src + capCall(src) + '\n}');
+      result = fn.call({}, sc, makeCap());
     } catch (e) {
       emit('hk.error', '模块执行失败 ' + key + ': ' + (e && e.message ? e.message : e));
       STORE.modules[cacheKey] = null;
@@ -1571,6 +1659,41 @@
     return exp;
   }
   HK.require = requireModule;
+
+  /* ==================================================================== *
+   * 6b. [FIX2-BUG7] 顶层定义收割：官方引擎里同一规则的页面代码、lazy、
+   * require 模块共享一个全局作用域，顶层 function/var 互相可见。本运行时
+   * 每次执行都新建作用域，定义随执行结束丢失（中国X站 lazy 读不到 detail
+   * 的 jGet、CMS 跨模块读不到 version）。等价做法：静态扫出源码里的顶层
+   * 声明名，执行末尾在同一 with 块内把这些名字的值收割进 STORE.shared
+   * （按规则名隔离），makeScope 建作用域时再注入。局限：只收割每条
+   * var/let/const 语句的首个名字；顶层 return 提前返回时收割不到；
+   * 收割的是闭包本身，其捕获的原作用域对象仍被引用，行为与官方一致。
+   * ==================================================================== */
+  function declNames(src) {
+    var seen = {}, out = [];
+    var re = /(?:^|[;{}\n])\s*(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(|(?:^|[;{}\n])\s*(?:var|let|const)\s+([A-Za-z_$][\w$]*)/g, m;
+    while ((m = re.exec(src))) {
+      var n = m[1] || m[2];
+      if (n && !seen[n] && n !== '__scope' && n !== '__cap') { seen[n] = 1; out.push(n); }
+    }
+    return out;
+  }
+  function capCall(src) {
+    var ns = declNames(src), pairs = [];
+    for (var i = 0; i < ns.length; i++) {
+      pairs.push(JSON.stringify(ns[i]) + ':(typeof ' + ns[i] + '!=="undefined"?' + ns[i] + ':void 0)');
+    }
+    return pairs.length ? '\n;try{__cap({' + pairs.join(',') + '});}catch(e){}' : '';
+  }
+  function makeCap() {
+    return function (bag) {
+      if (!bag) return;
+      var rn = HK.ruleName() || '';
+      var bag2 = STORE.shared[rn] || (STORE.shared[rn] = {});
+      for (var k in bag) if (has(bag, k) && bag[k] !== undefined) bag2[k] = bag[k];
+    };
+  }
 
   /* ==================================================================== *
    * 7. 规则执行
@@ -1615,8 +1738,8 @@
     if (extraVars) for (var k in extraVars) if (has(extraVars, k)) sc[k] = extraVars[k];
     /* input 与 MY_URL 等同步到作用域 */
     try {
-      var fn = new Function('__scope', 'with(__scope){\n' + src + '\n}');
-      fn.call({}, sc);
+      var fn = new Function('__scope', '__cap', 'with(__scope){\n' + src + capCall(src) + '\n}');
+      fn.call({}, sc, makeCap());
       finishResult();
       return { ok: true, result: OUT.result, err: '' };
     } catch (e) {
@@ -1624,6 +1747,13 @@
     }
   }
   HK.run = run;
+
+  /* [FIX2-BUG3] $().rule(fn) / $(url).rule(fn) 生成的 @rule= 内容就是
+   * fn 本人的源码（裸函数/箭头函数）。表达式求值只会得到函数对象本身，
+   * 不调用就永远只是「刷新一下」进不了详情（HoHoJ 卡片即此形态）。
+   * 源码形态确认是裸函数且求值结果是函数时，立即以 input 为参数调用它，
+   * 用其返回值与 setResult 作为本次结果。 */
+  var BARE_FN_RE = /^\s*\(?\s*(?:async\s+)?(?:function\s*[A-Za-z_$]*\s*\([^)]*\)|(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>)/;
 
   /* 执行 lazyRule / @rule= 里内联的 JS 表达式 */
   function runInline(code, extraVars) {
@@ -1636,11 +1766,20 @@
       var fn = new Function('__scope', 'with(__scope){\nreturn (' + src + '\n);}');
       var v = fn.call({}, sc);
       finishResult();
+      if (typeof v === 'function' && BARE_FN_RE.test(src)) {
+        try {
+          var v2 = v(str((PAGE.input === undefined || PAGE.input === null) ? '' : PAGE.input));
+          finishResult();
+          return { ok: true, value: v2, result: OUT.result };
+        } catch (e3) {
+          return { ok: false, err: (e3 && e3.name ? e3.name + ': ' : '') + str(e3 && e3.message || e3) };
+        }
+      }
       return { ok: true, value: v, result: OUT.result };
     } catch (e1) {
       try {
-        var fn2 = new Function('__scope', 'with(__scope){\n' + src + '\n}');
-        fn2.call({}, sc);
+        var fn2 = new Function('__scope', '__cap', 'with(__scope){\n' + src + capCall(src) + '\n}');
+        fn2.call({}, sc, makeCap());
         finishResult();
         return { ok: true, value: OUT.result, result: OUT.result };
       } catch (e2) {

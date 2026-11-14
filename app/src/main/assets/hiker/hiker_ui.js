@@ -28,9 +28,36 @@
     /* [A-P0-10] 分页上下文：{code, baseVars, page, title}，由 runPage 的
      * pagerMode 建立（home/search/detail），「加载下一页」按它递增 MY_PAGE */
     pager: null,
-    pagerCls: ''
+    pagerCls: '',
+    /* [FIX2-BUG1] 当前分类的 class_url（fyclass 模板替换用），
+     * 进站时取首个，点分类条目时由 navigate 按 URL 段更新 */
+    curClass: ''
   };
   UI.STATE = STATE;
+
+  /* ------------------------------------------------------------------ *
+   * [FIX2-BUG1] fyclass/fypage 模板替换。官方海阔打开规则时就把 homePage
+   * 里的占位换掉：fyclass→当前分类的 class_url（默认首个）、fypage→页码；
+   * 本 UI 原来原文直传，MY_URL 恒为字面 fyclass/fypage，find_rule 用
+   * MY_URL.split('##') 取不到分类，25 条规则 home 全灭（sim 主判定实测）。
+   * class_name/class_url 是平行数组（'&' 分隔字符串或数组），只用 url 列。
+   * 无占位的 URL 原样返回，老规则零影响。 */
+  function classUrls() {
+    var raw = (STATE.site && STATE.site.raw) || {};
+    var v = raw.class_url;
+    if (Array.isArray(v)) return v.map(function (x) { return str(x).trim(); }).filter(function (x) { return !!x; });
+    return str(v).split('&').map(function (x) { return x.trim(); }).filter(function (x) { return !!x; });
+  }
+  function firstClassUrl() { var u = classUrls(); return u.length ? u[0] : ''; }
+  function substTpl(url, page) {
+    var u = str(url);
+    if (u.indexOf('fyclass') < 0 && u.indexOf('fypage') < 0) return u;
+    var cls = STATE.curClass || firstClassUrl();
+    return u.replace(/fyclass/g, function () { return cls; })
+            .replace(/fypage/g, function () { return String(page || 1); });
+  }
+  UI.substTpl = substTpl;
+  UI.classUrls = classUrls;
 
   var LS_SITES = 'hiker_sites_v3';
 
@@ -222,9 +249,11 @@
     /* [A] 进站重置：选择登记表（旧回调指向已离开页面的作用域）与分页上下文 */
     global.__HK_SELECTS__ = {};
     STATE.pager = null;
+    /* [FIX2-BUG1] 进站默认分类 = 首个 class_url；页面 URL 先替换占位再入 PAGE */
+    STATE.curClass = firstClassUrl();
     var rule = s.raw;
     if (typeof rule.pages === 'string') { try { rule.pages = JSON.parse(rule.pages); } catch (e) { rule.pages = []; } }
-    HK.setPage({ rule: rule, ruleName: s.name, url: s.homePage, keyword: '', page: 1, title: s.name, pic: '', input: '' });
+    HK.setPage({ rule: rule, ruleName: s.name, url: substTpl(s.homePage, 1), keyword: '', page: 1, title: s.name, pic: '', input: '' });
     /* 模块缓存按站点隔离，切站点要清 */
     HK.STORE.modules = {};
     showView('rule');
@@ -251,11 +280,20 @@
   function runPage(code, vars, title, opts) {
     if (!code) { toast('这个站点没有配置该页规则'); return; }
     opts = opts || {};
-    STATE.lastRun = { code: code, vars: vars || {}, title: title || '' };
+    /* [FIX2-BUG1] 执行前替换 MY_URL 里的 fyclass/fypage（页码取 vars.MY_PAGE）；
+     * 分页上下文保存未替换的原始 vars，翻页时按新页码重新替换 */
+    var rawVars = vars || {};
+    var execVars = rawVars;
+    if (typeof rawVars.MY_URL === 'string' && /fyclass|fypage/.test(rawVars.MY_URL)) {
+      execVars = {};
+      for (var ek in rawVars) execVars[ek] = rawVars[ek];
+      execVars.MY_URL = substTpl(rawVars.MY_URL, rawVars.MY_PAGE || 1);
+    }
+    STATE.lastRun = { code: code, vars: execVars, title: title || '' };
     setBusy(true, title || '加载中…');
     setTimeout(function () {
       HK.resetOut();
-      var r = HK.run(code, vars || {});
+      var r = HK.run(code, execVars);
       setBusy(false);
       if (!r.ok) {
         showError('规则执行失败', r.err);
@@ -270,8 +308,9 @@
       if (opts.pager) {
         STATE.pager = {
           mode: opts.pager, code: code,
-          baseVars: JSON.parse(JSON.stringify(vars || {})),
-          page: (vars && vars.MY_PAGE) || 1,
+          /* [FIX2-BUG1] baseVars 存原始（未替换模板）vars，翻页按新页码重替换 */
+          baseVars: JSON.parse(JSON.stringify(rawVars)),
+          page: (rawVars && rawVars.MY_PAGE) || 1,
           title: title || ''
         };
       }
@@ -288,6 +327,8 @@
     var next = (pg.page || 1) + 1;
     var vars = JSON.parse(JSON.stringify(pg.baseVars || {}));
     vars.MY_PAGE = next;
+    /* [FIX2-BUG1] 翻页：模板 URL 按新页码重新替换（fyclass 保持当前分类） */
+    if (typeof vars.MY_URL === 'string') vars.MY_URL = substTpl(vars.MY_URL, next);
     STATE.lastRun = { code: pg.code, vars: vars, title: pg.title };
     setBusy(true, '加载第 ' + next + ' 页…');
     setTimeout(function () {
@@ -686,7 +727,7 @@
         renderItems(items, (it && it.title) || '');
         return;
       }
-      if (typeof r.value === 'string' && r.value && r.value !== 'hiker://empty') { navigate(r.value); return; }
+      if (typeof r.value === 'string' && r.value && r.value !== 'hiker://empty') { navigate(r.value, it && it.extra); return; }
       var top = STATE.stack[STATE.stack.length - 1];
       if (top) renderItems(top.items, top.title);
     }, 20);
@@ -756,7 +797,7 @@
         if (items && items.length) { STATE.stack.push({ title: it.title, items: items, url: HK.page.url }); renderItems(items, it.title); return; }
         /* 没有结果就当作刷新当前页 */
         if (typeof back === 'string' && back && back !== 'hiker://empty' && back.indexOf('hiker://empty#') !== 0) {
-          navigate(back); return;
+          navigate(back, it.extra); return;
         }
         refreshCurrent();
       }, 20);
@@ -775,11 +816,11 @@
     if (pu.search !== null && pu.search !== undefined && pu.search !== '') { doSearch(pu.search); return; }
 
     /* 4) 站内跳转（hiker://page/…、hiker://empty?…）→ 重新跑详情/列表规则 */
-    if (/^hiker:\/\//.test(url)) { navigate(url); return; }
+    if (/^hiker:\/\//.test(url)) { navigate(url, it.extra); return; }
 
     /* 5) 普通网页 */
     if (/^https?:\/\//.test(url)) {
-      if (STATE.site && STATE.site.rules.detail) { navigate(url); return; }
+      if (STATE.site && STATE.site.rules.detail) { navigate(url, it.extra); return; }
       openWeb(url);
       return;
     }
@@ -788,20 +829,36 @@
 
   var PLAY_TARGET = null;
 
-  /* 站内跳转：把 URL 交给「详情或二级列表」规则 */
-  function navigate(url) {
+  /* 站内跳转：把 URL 交给「详情或二级列表」规则。
+   * [FIX2-BUG1] 目标 URL 形如 base##<分类>##<页码> 且分类段是具体值时，
+   * 记为当前分类（点分类条目即走这里）；随后一律走模板替换（页码归 1）。
+   * [FIX2-BUG4] 第二参数 extra = 被点条目的 item.extra，按官方语义注入
+   * 下一页 MY_PARAMS（与 URL 查询参数合并，extra 优先），详情规则里
+   * getParam/MY_PARAMS 才能读到（如影探4K 的 extra.id=vod_id）。 */
+  function navigate(url, extra) {
     if (!STATE.site) return;
     /* [A-P0-6] 跳转目标也可能是动作 scheme（lazy 返回值等路径） */
     if (dispatchAction(url, PLAY_TARGET || {})) return;
-    HK.setPage({ url: url, title: PLAY_TARGET ? PLAY_TARGET.title : HK.page.title, pic: PLAY_TARGET ? PLAY_TARGET.pic_url : '', input: url });
+    var segs = str(url).split('##');
+    if (segs.length >= 3 && segs[1] && segs[1] !== 'fyclass' && segs[1] !== 'fypage') {
+      STATE.curClass = segs[1];
+    }
+    var pageUrl = substTpl(url, 1);
+    HK.setPage({ url: pageUrl, title: PLAY_TARGET ? PLAY_TARGET.title : HK.page.title, pic: PLAY_TARGET ? PLAY_TARGET.pic_url : '', input: url });
     var code = STATE.site.rules.detail || STATE.site.rules.sdetail || STATE.site.rules.home;
-    runPage(code, { MY_URL: url, MY_TITLE: HK.page.title, MY_PIC: HK.page.pic, input: url, MY_PAGE: 1 },
-      PLAY_TARGET ? PLAY_TARGET.title : '详情', { pager: 'detail' });
+    var vars = { MY_URL: url, MY_TITLE: HK.page.title, MY_PIC: HK.page.pic, input: url, MY_PAGE: 1 };
+    if (extra && typeof extra === 'object') {
+      var merged = HK.parseQuery(pageUrl);
+      var hasExtra = false;
+      for (var xk in extra) if (Object.prototype.hasOwnProperty.call(extra, xk)) { merged[xk] = extra[xk]; hasExtra = true; }
+      if (hasExtra) vars.MY_PARAMS = merged;
+    }
+    runPage(code, vars, PLAY_TARGET ? PLAY_TARGET.title : '详情', { pager: 'detail' });
   }
 
   function refreshCurrent() {
     if (!STATE.site) return;
-    HK.setPage({ url: STATE.site.homePage });
+    HK.setPage({ url: substTpl(STATE.site.homePage, 1) });
     runPage(STATE.site.rules.home, { MY_URL: STATE.site.homePage, MY_PAGE: 1, input: '', MY_KEYWORD: '' }, '首页', { pager: 'home' });
   }
 

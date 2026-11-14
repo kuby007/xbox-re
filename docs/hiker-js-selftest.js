@@ -199,6 +199,66 @@ check('_pd/_pdfa/_pdfh/_pdfl 别名已定义',
 t = runRes('js:setResult(getColTypes().indexOf("flex_button") >= 0 ? "yes" : "no")');
 check('getColTypes 含 flex_button', t.value === 'yes', JSON.stringify(t));
 
+/* ---------------- [FIX2] 七项运行时修复的回归用例 ---------------- */
+const UI2 = sb.HikerUI;
+
+/* BUG-1: fyclass/fypage 模板替换（UI 层纯函数） */
+UI2.STATE.site = { name: 'TplT', raw: { class_name: '最新&AI短剧', class_url: 'home&ai-duanju' }, homePage: 'hiker://empty##fyclass##fypage' };
+UI2.STATE.curClass = '';
+check('BUG-1 substTpl 默认首个分类+第1页',
+  UI2.substTpl('hiker://empty##fyclass##fypage', 1) === 'hiker://empty##home##1',
+  UI2.substTpl('hiker://empty##fyclass##fypage', 1));
+UI2.STATE.curClass = 'ai-duanju';
+check('BUG-1 substTpl 当前分类+翻页',
+  UI2.substTpl('hiker://empty##fyclass##fypage', 3) === 'hiker://empty##ai-duanju##3');
+check('BUG-1 无占位 URL 原样返回', UI2.substTpl('https://a.b/c?x=1', 2) === 'https://a.b/c?x=1');
+UI2.STATE.site = null; UI2.STATE.curClass = '';
+
+/* BUG-2: encodeLazy 带参箭头函数必须加括号（CMS模板选集实测炸点） */
+t = runRes('js:setResult($("hiker://empty").lazyRule((arg) => { return "got:" + arg; }, "X"))');
+const lazyPart = (function () { try { return HK.parseUrl(t.value).lazy || ''; } catch (e) { return ''; } })();
+check('BUG-2 lazyRule 箭头函数带参已整体加括号',
+  lazyPart.indexOf('((arg)') === 0 && lazyPart.slice(-6) === ')("X")', lazyPart);
+HK.resetOut();
+const lr2 = HK.runInline(lazyPart);
+check('BUG-2 编码后的 lazy 可执行出结果', lr2.ok && lr2.value === 'got:X', JSON.stringify(lr2));
+
+/* BUG-3: $().rule(fn) 裸函数点击时执行函数体（HoHoJ 卡片形态） */
+HK.resetOut();
+const brA = HK.runInline('js:() => { return "bare-called"; }');
+check('BUG-3 裸箭头函数被调用而非当值返回', brA.ok && brA.value === 'bare-called', JSON.stringify(brA));
+HK.resetOut();
+const brB = HK.runInline('js:function () { return "fn-called"; }');
+check('BUG-3 裸 function 被调用', brB.ok && brB.value === 'fn-called', JSON.stringify(brB));
+HK.resetOut();
+const brC = HK.runInline('js:1 + 2');
+check('BUG-3 普通表达式不被误调用', brC.ok && brC.value === 3, JSON.stringify(brC));
+
+/* BUG-4: extra 注入 MY_PARAMS 后 getParam 能读到（影探4K extra.id 形态） */
+HK.setPage({ rule: { title: 'T4', url: 'hiker://empty' }, ruleName: 'T4', url: 'hiker://page/detail', page: 1, input: '' });
+t = runRes('js:setResult(getParam("id") + "/" + MY_PARAMS.id)',
+  { MY_URL: 'hiker://page/detail', MY_PARAMS: { id: 'vod42' } });
+check('BUG-4 getParam 读到 MY_PARAMS(extra)', t.value === 'vod42/vod42', JSON.stringify(t));
+
+/* BUG-5: $.require('hiker://page/<别名>') 回退到已落盘核心文件（HoHoJ 形态） */
+HK.setPage({ rule: { title: 'HoHoJT', pages: [] }, ruleName: 'HoHoJT', url: 'hiker://empty', page: 1, input: '' });
+HK.STORE.files['hiker://files/rules/HoHoJT/HoHoJT.js'] = '$.exports = { ping: "pong" };';
+t = runRes('js:setResult($.require("hiker://page/HoHoJTCore").ping)');
+check('BUG-5 page 别名按 basename 回退落盘文件', t.value === 'pong', JSON.stringify(t));
+
+/* BUG-6: config/initConfig 全局（聚阅形态）+ java.lang.Thread.sleep（DrpyHiker 形态） */
+t = runRes('js:initConfig({T6: "u1"}); setResult(config.T6 + "/" + typeof config.MISSING)');
+check('BUG-6 config/initConfig 往返、无值不报错', t.value === 'u1/undefined', JSON.stringify(t));
+t = runRes('js:setResult(typeof java.lang.Thread.sleep)');
+check('BUG-6 java.lang.Thread.sleep 存在', t.value === 'function', JSON.stringify(t));
+
+/* BUG-7: 同规则顶层定义跨 run→runInline 共享（中国X站 jGet 形态） */
+HK.setPage({ rule: { title: 'T7', pages: [] }, ruleName: 'T7', url: 'hiker://empty', page: 1, input: '' });
+runRes('js:function jGet(x) { return "JG" + x; } var t7ver = "v9"; setResult("page-done")');
+HK.resetOut();
+const sh7 = HK.runInline('js:jGet("!") + "/" + t7ver');
+check('BUG-7 lazy 可见同页顶层 function/var', sh7.ok && sh7.value === 'JG!/v9', JSON.stringify(sh7));
+
 console.log('---');
 console.log('selftest: ' + pass + ' passed, ' + fail + ' failed');
 process.exit(fail ? 1 : 0);
