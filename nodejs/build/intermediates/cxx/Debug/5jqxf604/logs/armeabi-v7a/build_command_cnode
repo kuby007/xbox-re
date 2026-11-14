@@ -1,4 +1,0 @@
-/home/hatch/workspace/tools/android-sdk/cmake/3.22.1/bin/ninja \
-  -C \
-  /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/nodejs/.cxx/Debug/5jqxf604/armeabi-v7a \
-  cnode

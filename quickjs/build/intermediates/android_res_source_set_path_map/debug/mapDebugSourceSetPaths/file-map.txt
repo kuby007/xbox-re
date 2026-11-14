@@ -1,9 +1,0 @@
-com.fongmi.android.tv.quickjs-pngs-0 /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/quickjs/build/generated/res/pngs/debug
-com.fongmi.android.tv.quickjs-updated_navigation_xml-1 /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/quickjs/build/generated/updated_navigation_xml/debug
-com.fongmi.android.tv.quickjs-mergeDebugResources-2 /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/quickjs/build/intermediates/incremental/debug/mergeDebugResources/merged.dir
-com.fongmi.android.tv.quickjs-mergeDebugResources-3 /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/quickjs/build/intermediates/incremental/debug/mergeDebugResources/stripped.dir
-com.fongmi.android.tv.quickjs-debug-4 /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/quickjs/build/intermediates/merged_res/debug/mergeDebugResources
-com.fongmi.android.tv.quickjs-debug-5 /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/quickjs/build/intermediates/packaged_res/debug/packageDebugResources
-com.fongmi.android.tv.quickjs-debug-6 /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/quickjs/src/debug/res
-com.fongmi.android.tv.quickjs-main-7 /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/quickjs/src/main/res
-gradleHome-0 /home/hatch/.gradle-hiker

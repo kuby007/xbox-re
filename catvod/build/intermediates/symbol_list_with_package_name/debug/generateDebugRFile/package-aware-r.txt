@@ -1,3 +1,0 @@
-com.github.catvod.crawler
-array doh_name
-array doh_url

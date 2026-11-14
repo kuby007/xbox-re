@@ -1,3 +1,0 @@
-ninja: Entering directory `/home/hatch/workspace/projects/xbox-hiker/work/xbox-re/nodejs/.cxx/Debug/5jqxf604/x86'
-[1/2] Building CXX object CMakeFiles/cnode.dir/node_bridge.cpp.o
-[2/2] Linking CXX shared library /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/nodejs/build/intermediates/cxx/Debug/5jqxf604/obj/x86/libcnode.so

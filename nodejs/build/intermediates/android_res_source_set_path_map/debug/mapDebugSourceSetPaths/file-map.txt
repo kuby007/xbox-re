@@ -1,9 +1,0 @@
-com.fongmi.android.tv.nodejs-pngs-0 /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/nodejs/build/generated/res/pngs/debug
-com.fongmi.android.tv.nodejs-updated_navigation_xml-1 /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/nodejs/build/generated/updated_navigation_xml/debug
-com.fongmi.android.tv.nodejs-mergeDebugResources-2 /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/nodejs/build/intermediates/incremental/debug/mergeDebugResources/merged.dir
-com.fongmi.android.tv.nodejs-mergeDebugResources-3 /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/nodejs/build/intermediates/incremental/debug/mergeDebugResources/stripped.dir
-com.fongmi.android.tv.nodejs-debug-4 /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/nodejs/build/intermediates/merged_res/debug/mergeDebugResources
-com.fongmi.android.tv.nodejs-debug-5 /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/nodejs/build/intermediates/packaged_res/debug/packageDebugResources
-com.fongmi.android.tv.nodejs-debug-6 /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/nodejs/src/debug/res
-com.fongmi.android.tv.nodejs-main-7 /home/hatch/workspace/projects/xbox-hiker/work/xbox-re/nodejs/src/main/res
-gradleHome-0 /home/hatch/.gradle-hiker
