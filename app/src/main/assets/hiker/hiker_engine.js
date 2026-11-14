@@ -287,18 +287,37 @@
 
   function parseHikerUrl(url) {
     var u = str(url);
-    /* [P1] 合集框架用全角分隔符拼入口（？？ / ；； / ＃ / ＝ / ＆）。
-     * 不归一化的话 scheme 里会带全角字符，page/模块名永远匹配不上，
-     * 表现就是「点子站没反应」。在解析最前端一次性换成半角。 */
-    u = u.replace(/\uFF1F/g, '?').replace(/\uFF1B/g, ';')
-         .replace(/\uFF03/g, '#').replace(/\uFF1D/g, '=')
-         .replace(/\uFF06/g, '&').replace(/\uFF20/g, '@')
-         .replace(/\uFF1A/g, ':');
+    /* [P1] 合集框架把 JS 代码整段塞进 hiker:// URL 时，代码里的
+     * ? ; , & 会被转义成**双全角**（？？ ；； ，， ＆＆），因为 ? 和 ; 本身是
+     * 这个 URL 方言的分隔符。这里必须按官方 8.83 StringUtil.decodeConflictStr
+     * 的**成对**语义还原。
+     *
+     * 曾经写成逐个字符 \uFF1F -> '?' ，于是 ？？ 变成 ??（两个问号），
+     * hiker://page/funcTools？？rule=X 解析出的模块名永远带 ??，
+     * 找不到 pages[] 里的 funcTools，合集子站点了没反应——整类规则被一个
+     * 粒度错误卡死。成对项必须排在单字符项之前。 */
+    u = u.replace(/？？/g, '?').replace(/＆＆/g, '&')
+         .replace(/；；/g, ';').replace(/，，/g, ',')
+         .replace(/\uFF1D/g, '=')   /* ＝ */
+         .replace(/\uFF20/g, '@')   /* ＠ */
+         .replace(/\uFF06/g, '&');  /* 单字符 ＆，需在 ＆＆ 之后 */
     var out = { raw: str(url), rawNormalized: u, base: u, flags: [], rule: null,
-                lazy: null, video: false, search: null, page: null };
+                lazy: null, jsPage: null, params: {}, video: false, search: null, page: null };
     var im = /(?:^|#)@?input=([^#]*)/.exec(u);
     if (im) {
       try { out.inputArg = JSON.parse(decodeURIComponent(im[1])); } catch (e) { out.inputArg = null; }
+    }
+    /* #fypage.js:<code> —— 合集框架的核心形态：执行 code 得到真实 URL。
+     * ；； 还原后，code 与后面的 ;GET;UTF-8;{} 用分号分隔，
+     * 所以取到第一个分号为止（代码里若出现分号一定是被转义过的）。 */
+    var jm = /(?:^|#)fypage\.js:([\s\S]*)$/.exec(u) || /(?:^|#)[^#]*?\.js:([\s\S]*)$/.exec(u);
+    if (jm) {
+      var tail = jm[1];
+      var semi = tail.indexOf(';');
+      var code = semi >= 0 ? tail.slice(0, semi) : tail;
+      out.jsPage = code;
+      out.rest = semi >= 0 ? tail.slice(semi + 1) : '';
+      out.base = u.slice(0, jm.index);
     }
     var m = RE_LAZY.exec(u);
     if (m) { out.lazy = m[1]; out.base = u.slice(0, m.index); }
@@ -328,7 +347,8 @@
     items: {},       /* 当前页面条目 id -> item（updateItem/findItem 用） */
     files: {},       /* 内存文件（未落盘时的兜底） */
     modules: {},     /* 模块缓存 ruleKey/path -> exports */
-    rawRules: {}     /* 规则原文缓存 */
+    rawRules: {},    /* 规则原文缓存 */
+    rules: {}        /* 规则名 -> 规则对象。合集框架靠它按 ?rule=X 路由到对的 pages */
   };
   HK.STORE = STORE;
 
@@ -338,9 +358,48 @@
   function myKey(k, ruleName) { return (ruleName || HK.ruleName() || '') + '@' + str(k); }
 
   /* 页面上下文：当前站点/规则/参数 */
-  var PAGE = { rule: null, ruleName: '', url: '', keyword: '', page: 1, title: '', pic: '' };
+  var PAGE = { rule: null, ruleName: '', url: '', keyword: '', page: 1, title: '', pic: '', params: {}, type: 'home' };
   HK.page = PAGE;
-  HK.setPage = function (o) { for (var k in o) if (has(o, k)) PAGE[k] = o[k]; };
+  HK.setPage = function (o) {
+    for (var k in o) if (has(o, k)) PAGE[k] = o[k];
+    /* 每次切换规则都登记一份：合集框架的模块是用
+     * hiker://page/<模块>?rule=<合集名> 定位的，问的是「到**那个**规则的
+     * pages 里找」。只认当前 PAGE.rule 的话，MY_RULE 换成子站之后
+     * funcTools / ClassTab 这些合集自带的模块就全找不到了。
+     *
+     * 注意必须存 pages 的**快照**：hijackEnv 会就地改写 MY_RULE
+     * （MY_RULE.pages = RULE.pages、MY_RULE.url = …）。海阔跑在 Rhino 上，
+     * MY_RULE 是每次求值的独立对象，改它不影响别人；我们这边 PAGE.rule 是
+     * 同一个引用，一改父规则的 pages 就被换成子站的，funcTools 跟着消失。 */
+    if (o && o.rule && typeof o.rule === 'object') {
+      var rn = str(o.ruleName || o.rule.title || '');
+      if (rn) HK.registerRule(rn, o.rule);
+    }
+  };
+  HK.registerRule = function (name, rule) {
+    if (!name || !rule || typeof rule !== 'object') return rule;
+    var pages = rule.pages;
+    if (typeof pages === 'string') { try { pages = JSON.parse(pages); } catch (e) { pages = []; } }
+    STORE.rules[str(name)] = {
+      title: str(rule.title || name),
+      rule: rule,
+      /* 只冻结「有哪些模块」，模块代码本身不变，元素引用可以共用 */
+      pages: isArr(pages) ? pages.slice() : []
+    };
+    return rule;
+  };
+  /* 取某个规则的 pages 数组（优先用注册时的快照） */
+  HK.pagesOf = function (rule) {
+    if (!rule) return [];
+    var entry = rule.__entry;
+    var p = entry ? entry.pages : rule.pages;
+    if (typeof p === 'string') { try { p = JSON.parse(p); } catch (e) { p = []; } }
+    return isArr(p) ? p : [];
+  };
+  HK.ruleByName = function (name) {
+    var e = STORE.rules[str(name)];
+    return e ? e.rule : null;
+  };
   HK.ruleName = function () { return PAGE.ruleName || (PAGE.rule && PAGE.rule.title) || ''; };
 
   /* 结果收集器：setResult / setHomeResult / d.push 最终都落这里 */
@@ -394,14 +453,59 @@
   HK.fetch = hkFetch;
 
   function findPage(name) {
-    var rule = PAGE.rule || {};
-    var pages = rule.pages;
-    if (typeof pages === 'string') { try { pages = JSON.parse(pages); } catch (e) { pages = []; } }
-    if (!isArr(pages)) return null;
-    for (var i = 0; i < pages.length; i++) if (pages[i] && str(pages[i].path) === str(name)) return pages[i];
+    var want = str(name);
+    var pages = HK.pagesOf(PAGE.rule);
+    var i;
+    for (i = 0; i < pages.length; i++) if (pages[i] && str(pages[i].path) === want) return pages[i];
+    /* 当前规则的 pages 可能已被 hijackEnv 就地换成子站的，
+     * 这时合集自带的模块要去注册表里的快照找。 */
+    for (var rn in STORE.rules) {
+      if (!has(STORE.rules, rn)) continue;
+      var ps = STORE.rules[rn].pages;
+      for (i = 0; i < ps.length; i++) if (ps[i] && str(ps[i].path) === want) return ps[i];
+    }
     return null;
   }
   HK.findPage = findPage;
+
+  var CONFIG_CACHE = {};
+  function makeRuleConfig(name) {
+    var key = name || '__default__';
+    if (CONFIG_CACHE[key]) return CONFIG_CACHE[key];
+    var data = {};
+    try {
+      var raw = (typeof localStorage !== 'undefined') ? localStorage.getItem('hk_config_' + key) : null;
+      if (raw) data = JSON.parse(raw) || {};
+    } catch (e) { data = {}; }
+    function save() {
+      try { if (typeof localStorage !== 'undefined') localStorage.setItem('hk_config_' + key, JSON.stringify(data)); } catch (e) {}
+    }
+    var obj;
+    if (typeof Proxy === 'function') {
+      obj = new Proxy(data, {
+        get: function (t, k) { return t[k]; },
+        set: function (t, k, v) { t[k] = v; save(); return true; },
+        deleteProperty: function (t, k) { delete t[k]; save(); return true; },
+        has: function (t, k) { return k in t; }
+      });
+    } else {
+      obj = data;
+    }
+    CONFIG_CACHE[key] = obj;
+    return obj;
+  }
+
+  /** 把一个页面变量挂成 PAGE 的访问器（get 实时读，set 写回 PAGE）。 */
+  function defLive(sc, name, key, dflt) {
+    Object.defineProperty(sc, name, {
+      configurable: true,
+      get: function () {
+        var v = PAGE[key];
+        return (v === undefined || v === null) ? dflt : v;
+      },
+      set: function (v) { var o = {}; o[key] = v; HK.setPage(o); }
+    });
+  }
 
   /* 建一个作用域：所有规则/模块代码都在这里面跑 */
   function makeScope(extra) {
@@ -454,9 +558,16 @@
      *   method_setResult.invoke(javaContext, result)
      *   method_setHomeResult.invoke(javaContext, …)
      * WebView 没有 Rhino，这几个符号一出现就 ReferenceError，整条规则中断。
-     * 这里把它们 shim 到同一个 setResult，语义等价（都是把结果交给宿主）。 */
+     * 这里把它们 shim 到同一个 setResult，语义等价（都是把结果交给宿主）。
+     *
+     * 取参位置必须按官方签名 invoke(javaContext, result, callbackKey, rule, type)
+     * ——结果在**第二个**参数。合集框架的劫持写法是
+     *   method_setResult.invoke(javaContext, myColl_el, param1, param2, param3)
+     * 共五个参数，若像以前那样取最后一个，拿到的是 MY_TYPE（字符串），
+     * 条目数组被丢掉，页面自然空白。 */
     var invokeShim = function () {
-      var a = arguments, v = a[a.length - 1];
+      var a = arguments;
+      var v = (a.length >= 2) ? a[1] : a[0];
       return setResult(v);
     };
     sc.javaContext = { toString: function () { return '[javaContext shim]'; } };
@@ -500,6 +611,12 @@
       for (var q in STORE.myVars) if (has(STORE.myVars, q) && q.indexOf(pre) === 0) out.push(q.slice(pre.length));
       return out;
     };
+    /* config：海阔的「每条规则一个持久配置对象」。
+     * 规则里到处是 config.聚阅 / config.remoteUrl = … 这种写法，
+     * 少了它整条规则第一行就 ReferenceError（聚阅就是这样挂的）。
+     * 用 Proxy 包一层，读写直接落 localStorage，跨次启动还在。 */
+    sc.config = makeRuleConfig(ruleName);
+
     sc.getItem = function (k, d) { return has(STORE.items, str(k)) ? STORE.items[str(k)] : (d === undefined ? '' : d); };
     sc.setItem = function (k, v) { STORE.items[str(k)] = v; return v; };
     sc.clearItem = function (k) { if (k === undefined) STORE.items = {}; else delete STORE.items[str(k)]; return true; };
@@ -522,6 +639,8 @@
 
     /* 页面参数 */
     sc.getParam = function (k, d, u) {
+      /* 先看点卡片带过来的参数表（等价海阔 MY_PARAMS），再退到 URL 查询串。 */
+      if (!u && PAGE.params && has(PAGE.params, str(k))) return PAGE.params[str(k)];
       var url = str(u || PAGE.url || ''), i = url.indexOf('?');
       if (i < 0) return d === undefined ? '' : d;
       var qs = url.slice(i + 1).split('#')[0].split('&');
@@ -631,10 +750,14 @@
       return true;
     };
 
-    /* 本页变量（海阔注入的全局） */
-    sc.MY_URL = str(PAGE.url || '');
-    sc.MY_PAGE = PAGE.page || 1;
-    sc.MY_KEYWORD = str(PAGE.keyword || '');
+    /* 本页变量（海阔注入的全局）。
+     * 必须是**实时**的：$.require 出来的模块只加载一次并缓存，
+     * 如果这里写成快照，模块里的 MY_URL 就永远停在第一次加载时的值 ——
+     * 表现就是「首页能出内容，点进详情还是拿首页的 URL」，规则报「解析ID失败」。
+     * 改成读写都落到 PAGE 上的访问器，模块缓存才安全。 */
+    defLive(sc, 'MY_URL', 'url', '');
+    defLive(sc, 'MY_PAGE', 'page', 1);
+    defLive(sc, 'MY_KEYWORD', 'keyword', '');
     /* [P3] 合集框架的 hijackEnv() 会改写 MY_RULE。若这里是快照，改写后
      * 规则读到的还是旧对象 → 子站进不去。改成 getter，随 PAGE.rule 实时变。 */
     Object.defineProperty(sc, 'MY_RULE', {
@@ -642,9 +765,34 @@
       get: function () { return PAGE.rule || {}; },
       set: function (v) { HK.setPage({ rule: v }); }
     });
-    sc.MY_TITLE = str(PAGE.title || '');
-    sc.MY_PIC = str(PAGE.pic || '');
-    sc.MY_PARAMS = '';
+    defLive(sc, 'MY_TITLE', 'title', '');
+    defLive(sc, 'MY_PIC', 'pic', '');
+    /* 海阔的求值上下文常量。合集框架的 setResult 劫持直接读它们：
+     *   setResult = (p0,p1,p2,p3) => { p1 = CALLBACK_KEY; p2 = MY_RULE; p3 = MY_TYPE; … }
+     * 少一个就是 ReferenceError，整页白屏。MY_TYPE 用页面阶段（home/detail/search）。 */
+    defLive(sc, 'MY_TYPE', 'type', 'home');
+    sc.CALLBACK_KEY = 'hiker_callback';
+    sc.MY_TICKET = '1';
+    /* QING_TITLE：合集框架的**全局合集标识**。子站规则里到处拿它拼
+     * hiker://page/frameLoad?rule=<QING_TITLE>，但它往往只在 frameLoad 的
+     * 函数作用域里被 const 声明过一次；一旦从别的求值入口进来（点子站卡片、
+     * 进详情），QING_TITLE 就没有定义，拼出来是 rule=undefined，
+     * 再去 dataLoad 里找子站必然找不到。这里按合集名兜底。 */
+    Object.defineProperty(sc, 'QING_TITLE', {
+      configurable: true,
+      get: function () {
+        return str(HK.getMyVar('myCollection') || PAGE.ruleName || (PAGE.rule && PAGE.rule.title) || '');
+      },
+      set: function (v) { HK.setMyVar('myCollection', v); }
+    });
+    /* MY_PARAMS：海阔里点卡片时 extra 会变成下一页的参数表，
+     * 大量规则直接读 MY_PARAMS.id / MY_PARAMS.url 来取详情参数。
+     * 之前这里写死成空串，于是这类规则一律走到「缺少影片参数」分支。 */
+    Object.defineProperty(sc, 'MY_PARAMS', {
+      configurable: true,
+      get: function () { return PAGE.params || {}; },
+      set: function (v) { HK.setPage({ params: (v && typeof v === 'object') ? v : {} }); }
+    });
     sc.params = {};
     sc.input = '';
     sc.host = '';
@@ -653,6 +801,7 @@
 
     /* ---- $ 模块系统 ---- */
     sc.$ = makeDollar(null);
+    sc.$.__scope = sc;
     sc.require = function (name) { return sc.$.require(name); };
 
     /* ---- java.* 兼容层（少量真正需要的：Base64 / 字节数组） ---- */
@@ -907,11 +1056,45 @@
     var src = typeof fn === 'function' ? fn.toString() : str(fn);
     var a = [];
     for (var i = 0; i < (args || []).length; i++) a.push(JSON.stringify(args[i]));
-    return (a.length ? src + '(' + a.join(',') + ')' : src);
+    if (!a.length) return src;
+    /* 必须给函数体套一层括号：箭头函数 (a,b)=>{…}(x,y) 是**语法错误**，
+     * 只有 ((a,b)=>{…})(x,y) 才是「立即调用并绑定参数」。
+     * 合集规则里满屏这种写法（ClassTab 的分类按钮、Config 的配置项），
+     * 不套括号等于每个按钮点了都抛 SyntaxError。 */
+    return '(' + src + ')(' + a.join(',') + ')';
   }
 
+  var SELECT_REG = {}, SELECT_SEQ = 0;
+
+  /** 界面选中某一项后调用：设置 MY_INDEX，执行回调，把返回值交给调用方分发。 */
+  HK.pickSelect = function (id, index) {
+    var rec = SELECT_REG[id];
+    if (!rec || typeof rec.cb !== 'function') return { ok: false, err: '选择项已失效' };
+    try {
+      if (rec.scope) rec.scope.MY_INDEX = index;
+      var v = rec.cb(index);
+      return { ok: true, value: v };
+    } catch (e) {
+      return { ok: false, err: (e && e.message) ? e.message : String(e) };
+    }
+  };
+
   function makeDollar(modName) {
-    var d = function (x, hint) {
+    var d = function (x, hint, title) {
+      /* $(数组, 类型, 标题).select(回调)：海阔的「选择器」。
+       * 合集规则用它让用户选代码仓/线路（ghproxy / import 这些模块里到处都是）。
+       * 它必须返回一个**可点的 URL**，点开才弹选择框，选完设置 MY_INDEX 再跑回调。 */
+      if (Object.prototype.toString.call(x) === '[object Array]') {
+        return {
+          select: function (cb) {
+            var id = 'sel' + (++SELECT_SEQ);
+            SELECT_REG[id] = { cb: cb, scope: d.__scope || null };
+            return 'hiker://empty#@hkselect=' + id + '#'
+              + encodeURIComponent(JSON.stringify({ items: x, title: str(title || hint || '请选择') }));
+          },
+          toString: function () { return 'hiker://empty'; }
+        };
+      }
       var base;
       if (!x) base = 'hiker://empty';
       else if (str(x).indexOf('hiker://') === 0) base = str(x);
@@ -933,7 +1116,14 @@
         toString: function () { return base; }
       };
     };
-    d.toString = function (fn) { return typeof fn === 'function' ? fn.toString() : str(fn); };
+    /* $.toString(fn, p1, p2…)：把函数连同预设参数序列化成一段可执行代码。
+     * 合集框架靠它把「当前站点的上下文」钉进回调里（代码在别的求值环境跑，
+     * 拿不到外层变量，只能把值序列化进去）。 */
+    d.toString = function (fn) {
+      if (typeof fn !== 'function') return str(fn);
+      var rest = Array.prototype.slice.call(arguments, 1);
+      return encodeLazy(fn, rest);
+    };
     /* [P2] 合集框架用 $.require('page', 对象参数) 传子站配置。
      * 原来只接 name，第二参数被丢弃；而 requireModule 内部 str(对象) 又会
      * 变成 [object Object]。这里两个都修。 */
@@ -951,26 +1141,52 @@
    * 模块代码执行时 $ 指向它自己的模块对象，执行完取 $.exports。
    */
   function requireModule(name, importParam) {
-    var key = str(name);
+    /* 模块名里同样带冲突串：hiker://page/funcTools？？rule=X 必须按成对还原。 */
+    var key = str(name).replace(/？？/g, '?').replace(/＆＆/g, '&')
+                        .replace(/；；/g, ';').replace(/，，/g, ',');
     var param = importParam === undefined ? null : importParam;
     /* hiker://page/<模块名>[?<参数>]：等价于「按名字加载 pages[] 里的模块」，
      * 参数通过 $.importParam 传给模块（阅动漫的 dataLoad / funcTools 就靠这个）。 */
     var pm = /^hiker:\/\/page\/([^?#]+)(?:[?#]([\s\S]*))?$/.exec(key);
+    var routeRule = null;
     if (pm) {
       var modName = decodeURIComponent(pm[1]);
-      param = pm[2] === undefined ? (param || '') : pm[2];
+      var qs = pm[2] || '';
+      /* ?rule=<名> 指明「到哪个规则的 pages 里找这个模块」。
+       * 合集框架换成子站规则后，funcTools / ClassTab / hijackEnv 这些
+       * 模块都在**合集规则**里，不问 route 一律找不到。 */
+      var rm = /(?:^|[&;])rule=([^&;]*)/.exec(qs);
+      if (rm) {
+        var rn = decodeURIComponent(rm[1]);
+        routeRule = STORE.rules[rn] || null;
+      }
+      /* 关键：显式传进来的**对象**参数优先级高于 URL query。
+       * 合集框架的写法是 $.require('hiker://page/ClassTab?rule=店名', {站点配置})
+       * —— query 只是模块路由标识，模块真正要的配置在第二参数里。
+       * 以前这里无条件用 pm[2] 覆盖 param，对象参数被冲成字符串，
+       * 模块里 $.importParam.title / .url 全是 undefined，页面必然渲染不出来。 */
+      if (param === null || param === undefined || typeof param !== 'object') {
+        if (pm[2] !== undefined) param = pm[2];
+      }
       key = modName;
     }
-    var rule = PAGE.rule || {};
+    var rule = routeRule ? routeRule.rule : (PAGE.rule || {});
     /* [P2] 对象参数要保留类型；缓存 key 用稳定序列化，避免 [object Object] 撞车 */
     var paramKey = (param === null || param === undefined) ? ''
         : (typeof param === 'object' ? JSON.stringify(param) : str(param));
     var cacheKey = HK.ruleName() + '::' + key + (paramKey ? '::' + paramKey : '');
     if (has(STORE.modules, cacheKey)) return STORE.modules[cacheKey];
 
-    var pages = rule.pages;
-    if (typeof pages === 'string') pages = jparse(pages, []) || [];
-    if (!isArr(pages)) pages = [];
+    /* 路由命中时用注册时的快照 —— 父规则的 pages 会被 hijackEnv 就地改写成
+     * 子站的 pages，实时读会丢模块。 */
+    var pages;
+    if (routeRule) {
+      pages = routeRule.pages;
+    } else {
+      pages = rule.pages;
+      if (typeof pages === 'string') pages = jparse(pages, []) || [];
+      if (!isArr(pages)) pages = [];
+    }
 
     var page = null;
     for (var i = 0; i < pages.length; i++) {
@@ -982,7 +1198,10 @@
         var code = /^https?:\/\//.test(key) ? reqSync(key, {}) : fileRead(key);
         return runModule(key, code, cacheKey);
       }
-      emit('hk.error', '模块不存在: ' + key);
+      emit('hk.error', '模块不存在: ' + key
+        + ' [rule=' + str(rule && rule.title) + ' pages=' + pages.length
+        + ' route=' + (routeRule ? str(routeRule.title) : 'none')
+        + ' want=' + str(name).slice(0, 120) + ']');
       return null;
     }
     return runModule(key, str(page.rule || ''), cacheKey, param);
@@ -997,6 +1216,7 @@
     /* [P2] 对象参数原样透传（子站框架靠 $.importParam.site / .url 取配置） */
     mod$.importParam = (importParam === undefined || importParam === null) ? '' : importParam;
     var sc = makeScope({ '$': mod$, importParam: mod$.importParam });
+    mod$.__scope = sc;
     var result = null;
     try {
       var fn = new Function('__scope', 'with(__scope){\n' + src + '\n}');
@@ -1012,6 +1232,57 @@
     return exp;
   }
   HK.require = requireModule;
+
+  /**
+   * 加载并执行 pages[] 里的一个「页面模块」——也就是条目 url 写成
+   * hiker://page/<path> 时该干的事。
+   *
+   * 和 $.require 的区别：require 取 $.exports（数据/工具，不画界面）；
+   * 这里是**渲染一页**——模块通过 setResult / method_setResult.invoke 吐出
+   * 条目数组，由界面层画出来。
+   *
+   * 合集框架全靠这条路：首页把子站卡片写成
+   *   url: 'hiker://page/frameLoad?rule=阅动漫'
+   *   extra: { RULE: base64(子站规则), isIndex: true }
+   * 点下去要加载 frameLoad 模块、把 extra 当 MY_PARAMS、模块里 eval hijackEnv
+   * 换掉 MY_RULE，最后 setResult 吐子站首页。以前没有这条分支，
+   * 点击直接被当成「跳详情」，等于把子站入口丢进黑洞——合集类永远点不进去。
+   */
+  function runPageModule(path, params) {
+    var name = str(path);
+    /* 模块名也可能带冲突串与 ?rule= 尾缀 */
+    name = name.replace(/？？/g, '?').replace(/＆＆/g, '&')
+               .replace(/；；/g, ';').replace(/，，/g, ',');
+    var q = name.indexOf('?');
+    if (q >= 0) name = name.slice(0, q);
+    var pg = findPage(name);
+    if (!pg) { emit('hk.error', '页面模块不存在: ' + name); return { ok: false, err: '页面模块不存在: ' + name }; }
+    HK.setPage({ params: (params && typeof params === 'object') ? params : {} });
+    HK.resetOut();
+    var code = str(pg.rule).replace(/^\s*js:/, '');
+    var mod$ = makeDollar(name);
+    mod$.importParam = (params && typeof params === 'object') ? params : (params || '');
+    var sc = makeScope({ '$': mod$, importParam: mod$.importParam });
+    sc.$ = mod$;
+    mod$.__scope = sc;
+    try {
+      var fn = new Function('__scope', 'with(__scope){\n' + code + '\n}');
+      fn.call({}, sc);
+    } catch (e) {
+      var msg = (e && e.name ? e.name + ': ' : '') + str(e && e.message || e);
+      var stk = str(e && e.stack || '').split('\n').slice(1, 4).join(' | ').slice(0, 400);
+      emit('hk.error', '页面模块执行失败 ' + name + ': ' + msg + (stk ? ' << ' + stk : ''));
+      return { ok: false, err: msg };
+    }
+    return { ok: true, result: OUT.result, hasResult: OUT.hasResult };
+  }
+  HK.runPageModule = runPageModule;
+
+  /* 条目 url 是不是指向 pages 模块（hiker://page/xxx） */
+  HK.isPageUrl = function (url) {
+    var u = str(url).replace(/？？/g, '?').replace(/；；/g, ';');
+    return /^hiker:\/\/page\//.test(u);
+  };
 
   /* ==================================================================== *
    * 7. 规则执行
@@ -1060,6 +1331,30 @@
     }
   }
   HK.runInline = runInline;
+
+  /**
+   * 执行一段**语句式** JS 并取回最后表达式的值。
+   *
+   * 合集框架的 hiker://...#fypage.js:<code> 就是这种形态：
+   *   let { runCode, indexUrl } = $.require('hiker://page/funcTools?rule=X', {...});indexUrl(input);
+   * 规则要的是 indexUrl 的**返回值**（真实地址），不是 setResult 的结果。
+   * 所以不能用 runInline 的语句分支（它只收 OUT.result，返回值会丢）。
+   * 这里用 eval 包一层：eval 的返回值就是最后一条表达式的值。
+   */
+  function runJsPage(code, extraVars) {
+    var src = str(code);
+    if (!trim(src)) return { ok: false, err: '空代码' };
+    var sc = makeScope();
+    if (extraVars) for (var k in extraVars) if (has(extraVars, k)) sc[k] = extraVars[k];
+    try {
+      var fn = new Function('__scope', 'with(__scope){ return eval(' + JSON.stringify(src) + '); }');
+      var v = fn.call({}, sc);
+      return { ok: true, value: v, result: OUT.result };
+    } catch (e) {
+      return { ok: false, err: (e && e.name ? e.name + ': ' : '') + str(e && e.message || e) };
+    }
+  }
+  HK.runJsPage = runJsPage;
 
   /* 播放：走宿主 */
   HK.play = function (url, title, pic) {

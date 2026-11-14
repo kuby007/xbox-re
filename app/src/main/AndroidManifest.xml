@@ -97,11 +97,17 @@
         </provider>
 
         <!-- 阶段六：海阔独立入口。独立 WebView / 独立同步桥，不复用首页 webOverlay。 -->
+        <!-- 海阔小程序容器。
+             注意：这里**不能**声明 android:screenOrientation。
+             之前写的是 sensorLandscape，手机竖屏下点进来会先被强制转成横屏，
+             随后 onCreate 里再改回跟随用户方向 —— 一进一出两次翻转，
+             就是用户报的「海阔模块启动切横屏」。
+             不声明方向 = 不干预，容器跟着宿主当前方向走，一次都不翻。
+             保留 configChanges，旋转时不重建 WebView（页面栈与规则状态不会丢）。 -->
         <activity
             android:name=".hiker.HikerActivity"
-            android:configChanges="screenSize|smallestScreenSize|screenLayout|orientation"
-            android:exported="false"
-            android:screenOrientation="sensorLandscape" />
+            android:configChanges="screenSize|smallestScreenSize|screenLayout|orientation|keyboardHidden|uiMode"
+            android:exported="false" />
 
         <activity
             android:name=".ui.activity.CrashActivity"

@@ -13,6 +13,12 @@ android {
         targetSdk libs.versions.targetSdk.get().toInteger()
         python {
             version = "3.10"
+            // 构建机上的 3.10 解释器路径。Chaquopy 默认要求 PATH 里有 python3.10；
+            // 很多镜像（含 GitHub Actions 的 ubuntu-latest）默认只有 3.12，
+            // 于是 configure 阶段直接 "Couldn't find Python 3.10"。
+            // 优先级：CHAQUO_BUILD_PYTHON 环境变量 > Gradle 属性 chaquoBuildPython > 交给插件自己找。
+            def bp = System.getenv("CHAQUO_BUILD_PYTHON") ?: (project.findProperty("chaquoBuildPython") ?: "")
+            if (bp) buildPython bp.toString()
             pip {
                 install("-r", "requirements.txt")
             }

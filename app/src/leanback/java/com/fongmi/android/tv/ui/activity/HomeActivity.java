@@ -175,6 +175,12 @@ public class HomeActivity extends BaseActivity implements CustomTitleView.Listen
     @Override
     protected void initEvent() {
         mBinding.title.setListener(this);
+        // 小程序入口：遥控焦点落在图标上按确定键直达，独立 Activity，不占用首页 fragment 栈。
+        if (mBinding.hiker != null) {
+            mBinding.hiker.setOnClickListener(v -> com.fongmi.android.tv.hiker.HikerEntry.start(this));
+            mBinding.hiker.setOnFocusChangeListener((v, hasFocus) -> v.animate()
+                    .scaleX(hasFocus ? 1.12f : 1f).scaleY(hasFocus ? 1.12f : 1f).setDuration(140).start());
+        }
         mBinding.toolbar.addOnLayoutChangeListener((v, left, top, right, bottom, oldLeft, oldTop, oldRight, oldBottom) -> {
             syncNativeContentInset();
             syncWebOverlayLayout();

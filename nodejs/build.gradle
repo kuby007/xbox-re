@@ -6,7 +6,7 @@ android {
     namespace = 'com.fongmi.android.tv.nodejs'
 
     compileSdk libs.versions.compileSdk.get().toInteger()
-    ndkVersion = '28.2.13676358'
+    ndkVersion = '29.0.14206865'
 
     defaultConfig {
         minSdk libs.versions.minSdk.get().toInteger()

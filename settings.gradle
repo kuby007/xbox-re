@@ -1,14 +1,16 @@
 pluginManagement {
     repositories {
-        gradlePluginPortal()
-        mavenCentral()
+        // 顺序很关键：AGP 的插件标记只在 Google Maven 有。
+        // 若先问 Plugin Portal，网络受限时会先抛连接异常导致整次解析直接判失败。
         google()
+        mavenCentral()
+        gradlePluginPortal()
     }
 }
 
-plugins {
-    id "org.gradle.toolchains.foojay-resolver-convention" version "1.0.0"
-}
+// 工具链自动下载插件（foojay）已移除：
+// 1) 它会把构建绑死到 JetBrains 版 JDK 21，本地/离线环境拿不到就直接失败；
+// 2) CI 与本地都显式使用 JAVA_HOME 的 JDK 21，不需要自动下载。
 
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)

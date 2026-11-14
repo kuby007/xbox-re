@@ -10,6 +10,12 @@ if (localPropsFile.exists()) {
     }
 }
 def hasReleaseSigning = localProps['storeFile'] && localProps['keyAlias'] && localProps['storePassword']
+// storeFile 允许写绝对路径，也允许写相对路径（相对仓库根目录解析）。
+// 之前一律按 module 目录解析，导致 CI 里 storeFile=release.jks（放在根目录）找不到。
+def resolveStoreFile = { String path ->
+    def f = new File(path)
+    return f.isAbsolute() ? f : rootProject.file(path)
+}
 def releaseKeyPassword = localProps['keyPassword'] ?: localProps['storePassword']
 def fastRelease = (project.findProperty('fastRelease') ?: 'false').toString().toBoolean()
 def buildTimestamp = new Date().format('yyyyMMddHHmm', TimeZone.getTimeZone('Asia/Shanghai'))
@@ -83,9 +89,21 @@ android {
     sourceSets.main.jniLibs.srcDir(rootProject.file('third_party/exo-ass-native/prebuilt'))
 
     signingConfigs {
+        // debug 也用同一套签名（仅当 local.properties 里给了签名材料时）。
+        // 目的：四个变体（手机/TV × arm64/armv7a）签名一致，以后每一版都能互相覆盖安装，
+        // 不会出现「debug 包用随机 debug.keystore、换台机器就装不上」的老问题。
+        // 没给签名材料时自动回退到 AGP 默认 debug 签名，不影响任何人的常规构建。
+        debug {
+            if (hasReleaseSigning) {
+                storeFile resolveStoreFile(localProps['storeFile'])
+                keyAlias localProps['keyAlias']
+                keyPassword releaseKeyPassword
+                storePassword localProps['storePassword']
+            }
+        }
         release {
             if (hasReleaseSigning) {
-                storeFile file(localProps['storeFile'])
+                storeFile resolveStoreFile(localProps['storeFile'])
                 keyAlias localProps['keyAlias']
                 keyPassword releaseKeyPassword
                 storePassword localProps['storePassword']

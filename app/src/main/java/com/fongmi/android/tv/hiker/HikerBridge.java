@@ -110,6 +110,46 @@ public class HikerBridge {
         }
     }
 
+    /* ------------------------------------------------------------------ 输入来源 */
+
+    /**
+     * 读系统剪贴板。海阔「自动识别剪贴板口令」靠它 ——
+     * WebView 里 navigator.clipboard 在 file:// 下不可用，也没有用户手势，
+     * 只能走原生。Android 10+ 限制后台读剪贴板，但本页在前台且由用户点击触发，属允许范围。
+     */
+    @JavascriptInterface
+    public String clipboardText() {
+        if (activity == null) return "";
+        final String[] out = new String[]{""};
+        try {
+            activity.runOnUiThread(() -> {
+                try {
+                    android.content.ClipboardManager cm = (android.content.ClipboardManager)
+                            activity.getSystemService(android.content.Context.CLIPBOARD_SERVICE);
+                    if (cm == null || !cm.hasPrimaryClip()) return;
+                    android.content.ClipData clip = cm.getPrimaryClip();
+                    if (clip == null || clip.getItemCount() == 0) return;
+                    CharSequence cs = clip.getItemAt(0).coerceToText(activity);
+                    out[0] = cs == null ? "" : cs.toString();
+                } catch (Throwable ignored) {
+                }
+            });
+            /* runOnUiThread 在非 UI 线程是异步的，这里同步等一小会儿。
+             * JS 桥线程可以阻塞，UI 线程不会。 */
+            for (int i = 0; i < 40 && out[0].isEmpty(); i++) {
+                try { Thread.sleep(10); } catch (InterruptedException e) { break; }
+            }
+        } catch (Throwable ignored) {
+        }
+        return out[0];
+    }
+
+    /** 下拉系统文件选择器导入小程序（.hkzip / .zip / .json / 文本规则）。 */
+    @JavascriptInterface
+    public void pickRuleFile() {
+        if (activity != null) activity.requestRuleFile();
+    }
+
     /** 页面里的 toast 直接弹原生的（比 HTML toast 更显眼，也不会被 WebView 层挡住）。 */
     @JavascriptInterface
     public void toast(final String message) {
