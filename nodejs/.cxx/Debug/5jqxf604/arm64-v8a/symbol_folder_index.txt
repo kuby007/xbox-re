@@ -1,1 +1,0 @@
-/home/hatch/workspace/projects/xbox-hiker/work/xbox-re/nodejs/build/intermediates/cxx/Debug/5jqxf604/obj/arm64-v8a

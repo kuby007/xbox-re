@@ -1,3 +1,0 @@
-/home/hatch/workspace/projects/xbox-hiker/work/xbox-re/nodejs/.cxx/Debug/5jqxf604/armeabi-v7a/CMakeFiles/cnode.dir
-/home/hatch/workspace/projects/xbox-hiker/work/xbox-re/nodejs/.cxx/Debug/5jqxf604/armeabi-v7a/CMakeFiles/edit_cache.dir
-/home/hatch/workspace/projects/xbox-hiker/work/xbox-re/nodejs/.cxx/Debug/5jqxf604/armeabi-v7a/CMakeFiles/rebuild_cache.dir
