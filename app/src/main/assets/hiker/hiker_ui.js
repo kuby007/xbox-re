@@ -718,7 +718,8 @@
     setTimeout(function () {
       HK.resetOut();
       var code = 'js:return (' + entry.fn + ')(' + JSON.stringify(value === undefined ? '' : value) + ');';
-      var r = HK.runInline(code, { input: HK.page.url, MY_URL: HK.page.url });
+      /* [FIX3-BUG9] select 回调也是条目 lazy：同样注入 MY_INDEX（聚阅实证） */
+      var r = HK.runInline(code, { input: HK.page.url, MY_URL: HK.page.url, MY_INDEX: itemIndex(it) });
       setBusy(false);
       if (!r.ok) { toast('执行失败：' + r.err); log(r.err); return; }
       var items = HK.OUT.hasResult ? normalizeResult(HK.OUT.result) : null;
@@ -727,11 +728,54 @@
         renderItems(items, (it && it.title) || '');
         return;
       }
-      if (typeof r.value === 'string' && r.value && r.value !== 'hiker://empty') { navigate(r.value, it && it.extra); return; }
+      if (typeof r.value === 'string' && r.value && r.value !== 'hiker://empty') {
+        /* [FIX3-BUG8] select 回调返回播放地址串同样走播放出口 */
+        if (playLazyString(r.value, it)) return;
+        navigate(r.value, it && it.extra); return;
+      }
       var top = STATE.stack[STATE.stack.length - 1];
       if (top) renderItems(top.items, top.title);
     }, 20);
   }
+
+  /* [FIX3-BUG9] 条目在当前页（栈顶页）条目数组中的下标：页面栈里存的
+   * 就是 REFS 里的同一份对象引用，identity 查找即可；栈顶找不到时逐页
+   * 向下找（弹层回调等旁路），再找不到回 0——官方 MY_INDEX 恒有值，
+   * 不给 undefined（聚阅 select 回调读它曾 ReferenceError）。 */
+  function itemIndex(it) {
+    if (!it) return 0;
+    for (var s = STATE.stack.length - 1; s >= 0; s--) {
+      var arr = STATE.stack[s] && STATE.stack[s].items;
+      if (!arr) continue;
+      for (var i = 0; i < arr.length; i++) if (arr[i] === it) return i;
+    }
+    return 0;
+  }
+  UI.itemIndex = itemIndex;
+
+  /* [FIX3-BUG8] lazy/@rule/select 回调返回字符串的播放分发。官方语义里
+   * lazy 的返回值即条目的真实地址：http(s) 媒体/解析地址串应走播放
+   * 出口，而不是被当成页面 navigate 后拿详情规则重跑——19 条规则的
+   * 选集 lazy 已被探针实证返回 m3u8/mp4/签名媒体地址，却全卡在这里
+   * （sim 第二轮 BUG-8）。判别规则（与报告互注）：
+   *   - trim 后以 http:// 或 https:// 开头；
+   *   - 不是「页面型规则跳转」：含 @lazyRule / @rule= 尾巴的 http 串是
+   *     「页面地址+待执行规则」，仍走 navigate；hiker:// 串不匹配
+   *     http 前缀，自然走原有 scheme/navigate 路径；
+   *   - 命中即 HK.play（其内部 parsePlayTarget 会拆 #标记# 与
+   *     ;{请求头}）。返回 true 表示已按播放处理。 */
+  function playLazyString(s, it) {
+    var v = str(s).replace(/^\s+|\s+$/g, '');
+    if (!/^https?:\/\//i.test(v)) return false;
+    if (/@lazyRule|@rule=/.test(v)) return false;
+    var pu = HK.parseUrl(v);
+    if (pu.lazy || pu.rule) return false;
+    PLAY_TARGET = it || null;
+    var ok = HK.play(v, (it && it.title) || '', (it && (it.pic_url || it.pic)) || '');
+    toast(ok ? '正在播放：' + ((it && it.title) || '') : '交给播放器失败');
+    return true;
+  }
+  UI.playLazyString = playLazyString;
 
   function handleItem(it) {
     var ex = it.extra || {};
@@ -762,7 +806,7 @@
       setBusy(true, '处理中…');
       setTimeout(function () {
         HK.resetOut();
-        var rr = HK.runInline(inputCode, { input: val, MY_URL: HK.page.url });
+        var rr = HK.runInline(inputCode, { input: val, MY_URL: HK.page.url, MY_INDEX: itemIndex(it) });
         setBusy(false);
         if (!rr.ok) { toast('执行失败：' + rr.err); return; }
         var its = HK.OUT.hasResult ? normalizeResult(HK.OUT.result) : null;
@@ -789,14 +833,15 @@
         if (pu.rule && pu.base && /^https?:\/\//.test(pu.base)) {
           try { HK.run('js:setResCode(fetch(MY_URL))', { MY_URL: pu.base }); HK.resetOut(); } catch (e) {}
         }
-        var r = HK.runInline(code, { input: HK.page.url, MY_URL: HK.page.url });
+        var r = HK.runInline(code, { input: HK.page.url, MY_URL: HK.page.url, MY_INDEX: itemIndex(it) });
         setBusy(false);
         if (!r.ok) { toast('执行失败：' + r.err); log(r.err); return; }
         var back = r.value;
         var items = HK.OUT.hasResult ? normalizeResult(HK.OUT.result) : null;
         if (items && items.length) { STATE.stack.push({ title: it.title, items: items, url: HK.page.url }); renderItems(items, it.title); return; }
-        /* 没有结果就当作刷新当前页 */
+        /* [FIX3-BUG8] 返回值是 http(s) 播放地址串 → 播放出口，先于 navigate */
         if (typeof back === 'string' && back && back !== 'hiker://empty' && back.indexOf('hiker://empty#') !== 0) {
+          if (playLazyString(back, it)) return;
           navigate(back, it.extra); return;
         }
         refreshCurrent();

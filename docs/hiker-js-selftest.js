@@ -259,6 +259,95 @@ HK.resetOut();
 const sh7 = HK.runInline('js:jGet("!") + "/" + t7ver');
 check('BUG-7 lazy 可见同页顶层 function/var', sh7.ok && sh7.value === 'JG!/v9', JSON.stringify(sh7));
 
-console.log('---');
-console.log('selftest: ' + pass + ' passed, ' + fail + ' failed');
-process.exit(fail ? 1 : 0);
+/* ---------------- [FIX3] 第三轮四项修复的回归用例 ---------------- */
+
+/* BUG-9（引擎层）: MY_INDEX 与 MY_PAGE 同层，默认 0、vars 可注入 */
+t = runRes('js:setResult(typeof MY_INDEX + "/" + MY_INDEX)');
+check('BUG-9 MY_INDEX 默认 0（number）', t.value === 'number/0', JSON.stringify(t));
+t = runRes('js:setResult(MY_INDEX)', { MY_INDEX: 3 });
+check('BUG-9 MY_INDEX 经 vars 注入', t.value === 3, JSON.stringify(t));
+
+/* BUG-7 残留（CMS模板形态）: 模块顶层 var 在 require 返回后、同一次执行内可读 */
+HK.setPage({ rule: { title: 'T8', pages: [{ path: 'modV', rule: 'var version = { ver: "9.9" }; $.exports = {};' }] }, ruleName: 'T8', url: 'hiker://empty', page: 1, input: '' });
+t = runRes('js:$.require("modV"); setResult(version.ver)');
+check('BUG-7残留 require 后同次执行内可读模块顶层 var（全局镜像）', t.value === '9.9', JSON.stringify(t));
+
+/* BUG-5 残留（DrpyHiker 形态）: 裸名 require 按落盘常规路径探中
+ * data/<规则名>/subpage/<name>.js（文件只在桥盘、不在 STORE.files） */
+HK.setPage({ rule: { title: 'DrpyT', pages: [] }, ruleName: 'DrpyT', url: 'hiker://empty', page: 1, input: '' });
+const origCall = sb.HikerBridge.call;
+sb.HikerBridge.call = function (name, argsJson) {
+  if (name === 'readFile') {
+    let p = '';
+    try { p = JSON.parse(argsJson)[0] || ''; } catch (e) {}
+    if (p === 'hiker://files/data/DrpyT/subpage/updateRecords.js') return '$.exports = ["REC1"];';
+    return '';
+  }
+  return origCall.apply(this, arguments);
+};
+t = runRes('js:setResult($.require("updateRecords")[0])');
+sb.HikerBridge.call = origCall;
+check('BUG-5残留 裸名 require 探中 data/<规则>/subpage/<name>.js', t.value === 'REC1', JSON.stringify(t));
+
+/* BUG-8 + BUG-9（UI 层，异步）: 经真实 HikerUI.handleItem 点选集条目——
+ *  ① lazy 返回 m3u8 串 → 走 bridge.play、不导航；
+ *  ② lazy 返回 hiker:// 串 → 走 navigate 进详情页、不播放；
+ *  ③ lazy setResult 数组 → 渲染新页、不播放；
+ *  ④ lazy 返回带 @lazyRule 的 http 串 → 是页面型规则跳转，走 navigate、不播放；
+ *  ⑤ 条目 lazy 读 MY_INDEX → 等于它在当前页数组中的下标。 */
+const UI3 = sb.HikerUI;
+const playCalls = [];
+const origBridgePlay = sb.HikerBridge.play;
+sb.HikerBridge.play = function (u) { playCalls.push(u); return true; };
+UI3.STATE.site = {
+  name: 'T9', homePage: 'hiker://empty', raw: { title: 'T9' },
+  rules: {
+    home: 'js:setResult([])',
+    detail: 'js:setResult([{ title: "详情页条目", url: "hiker://empty", col_type: "text_1" }])'
+  }
+};
+HK.setPage({ rule: { title: 'T9', pages: [] }, ruleName: 'T9', url: 'hiker://empty', page: 1, input: '' });
+const epPlay = { title: '选集-m3u8', col_type: 'text_1', url: 'hiker://empty#@lazyRule=.js:() => { return "https://cdn.test/v/idx.m3u8"; }' };
+const epPage = { title: '选集-页面', col_type: 'text_1', url: 'hiker://empty#@lazyRule=.js:() => { return "hiker://page/detail"; }' };
+const epList = { title: '选集-列表', col_type: 'text_1', url: 'hiker://empty#@lazyRule=.js:() => { setResult([{ title: "子条目", url: "hiker://empty", col_type: "text_1" }]); }' };
+const epRule = { title: '选集-规则页', col_type: 'text_1', url: 'hiker://empty#@lazyRule=.js:() => { return "https://a.b/page#@lazyRule=.js:() => 1"; }' };
+const epIdx = { title: '选集-下标', col_type: 'text_1', url: 'hiker://empty#@lazyRule=.js:() => { setResult([{ title: "idx=" + MY_INDEX, url: "hiker://empty", col_type: "text_1" }]); }' };
+UI3.STATE.stack = [{ title: '详情', url: 'hiker://page/detail', items: [
+  { title: 'A', url: 'hiker://empty', col_type: 'text_1' },
+  { title: 'B', url: 'hiker://empty', col_type: 'text_1' },
+  epIdx
+] }];
+const stack0 = UI3.STATE.stack.length;
+function topTitle() {
+  const top = UI3.STATE.stack[UI3.STATE.stack.length - 1];
+  return (top && top.items && top.items[0] && top.items[0].title) || '';
+}
+UI3.handleItem(epPlay);
+setTimeout(function () {
+  const sPlay = { n: playCalls.length, u: playCalls[0] || '', stack: UI3.STATE.stack.length };
+  UI3.handleItem(epPage);
+  setTimeout(function () {
+    const sPage = { n: playCalls.length, stack: UI3.STATE.stack.length };
+    UI3.handleItem(epList);
+    setTimeout(function () {
+      const sList = { n: playCalls.length, stack: UI3.STATE.stack.length, top: topTitle() };
+      UI3.handleItem(epRule);
+      setTimeout(function () {
+        const sRule = { n: playCalls.length, stack: UI3.STATE.stack.length };
+        UI3.handleItem(epIdx);
+        setTimeout(function () {
+          check('BUG-8 lazy 返回 m3u8 串走播放出口', sPlay.n === 1 && sPlay.u === 'https://cdn.test/v/idx.m3u8', JSON.stringify(sPlay));
+          check('BUG-8 播放分支不导航', sPlay.stack === stack0, JSON.stringify(sPlay));
+          check('BUG-8 lazy 返回 hiker:// 串走导航不播放', sPage.n === 1 && sPage.stack === stack0 + 1, JSON.stringify(sPage));
+          check('BUG-8 lazy setResult 数组渲染新页不播放', sList.n === 1 && sList.stack === stack0 + 2 && sList.top === '子条目', JSON.stringify(sList));
+          check('BUG-8 带 @lazyRule 的 http 串是页面跳转不播放', sRule.n === 1 && sRule.stack === stack0 + 3, JSON.stringify(sRule));
+          check('BUG-9 UI 注入 MY_INDEX=条目下标', topTitle() === 'idx=2', topTitle());
+          sb.HikerBridge.play = origBridgePlay;
+          console.log('---');
+          console.log('selftest: ' + pass + ' passed, ' + fail + ' failed');
+          process.exit(fail ? 1 : 0);
+        }, 250);
+      }, 250);
+    }, 250);
+  }, 250);
+}, 250);

@@ -369,7 +369,7 @@
 
   /* 页面上下文：当前站点/规则/参数 */
   var PAGE = { rule: null, ruleName: '', url: '', keyword: '', page: 1, title: '', pic: '',
-               input: '', params: {}, reversed: false };
+               input: '', params: {}, reversed: false, index: 0 };
   HK.page = PAGE;
   HK.setPage = function (o) { for (var k in o) if (has(o, k)) PAGE[k] = o[k]; };
   HK.ruleName = function () { return PAGE.ruleName || (PAGE.rule && PAGE.rule.title) || ''; };
@@ -1170,6 +1170,11 @@
     }
     liveProp('MY_URL', function () { return str(PAGE.url || ''); }, function (v) { PAGE.url = str(v); });
     liveProp('MY_PAGE', function () { return PAGE.page || 1; }, function (v) { PAGE.page = v; });
+    /* [FIX3-BUG9] MY_INDEX：被点条目在当前页条目数组里的下标（0 起），官方海阔
+     * 在条目 lazy/select 回调作用域里恒提供；原来作用域里根本没有这个名字，
+     * 聚阅的 select 回调一读就 ReferenceError。与 MY_PAGE 同层走 PAGE 绑定，
+     * UI 点击时经 vars 注入（见 hiker_ui 的 itemIndex），未知时默认 0。 */
+    liveProp('MY_INDEX', function () { return (PAGE.index === undefined || PAGE.index === null) ? 0 : PAGE.index; }, function (v) { PAGE.index = v; });
     liveProp('MY_KEYWORD', function () { return str(PAGE.keyword || ''); }, function (v) { PAGE.keyword = str(v); });
     /* [P3] 合集框架的 hijackEnv() 会改写 MY_RULE。若这里是快照，改写后
      * 规则读到的还是旧对象 → 子站进不去。改成 getter，随 PAGE.rule 实时变。 */
@@ -1546,10 +1551,12 @@
     /* [P2] 合集框架用 $.require('page', 对象参数) 传子站配置。
      * 原来只接 name，第二参数被丢弃；而 requireModule 内部 str(对象) 又会
      * 变成 [object Object]。这里两个都修。 */
-    d.require = function (name, param) { return requireModule(name, param); };
+    /* [FIX3-BUG5] 把本模块的 key 作为 fromKey 传下去：裸名 require 时
+     * requireModule 能按「调用方所在目录」相对解析（subpage 兄弟文件）。 */
+    d.require = function (name, param) { return requireModule(name, param, modName); };
     d.exports = null;
     d.moduleName = modName;
-    d.requireMem = function (name, param) { return requireModule(name, param); };
+    d.requireMem = function (name, param) { return requireModule(name, param, modName); };
     d.hikerUrl = function (u) { return str(u); };
     return d;
   }
@@ -1582,7 +1589,7 @@
    * pages 可能是 JSON 字符串，也可能是数组。
    * 模块代码执行时 $ 指向它自己的模块对象，执行完取 $.exports。
    */
-  function requireModule(name, importParam) {
+  function requireModule(name, importParam, fromKey) {
     var origName = str(name);
     var key = origName;
     var param = importParam === undefined ? null : importParam;
@@ -1626,9 +1633,34 @@
       }
       var stored = findStoredModule(key);
       if (stored) return runModule(key, stored.code, cacheKey, param);
-      var guess = 'hiker://files/rules/' + (HK.ruleName() || '') + '/' + key + '.js';
-      var gc = fileRead(guess);
-      if (trim(gc)) return runModule(key, gc, cacheKey, param);
+      /* [FIX3-BUG5] 裸名解析（无 hiker:// 前缀、无扩展名，如 DrpyHiker 的
+       * $.require('updateRecords')）：文件只落桥盘（包内 data.zip 展开），
+       * 不在 STORE.files 内存表里，单靠原先一条 rules/<规则名> 猜测路径
+       * 命中不了实际布局（data/<规则名>/subpage/ 兄弟目录）。按官方
+       * 「相对规则文件目录解析」的语义逐个探常规位置，命中即加载：
+       *   0) 调用方模块所在目录（fromKey 是 hiker://files/ 路径时）；
+       *   1) data/<规则名>/subpage/（子页面模块的兄弟文件，实测布局）；
+       *   2) data/<规则名>/；3) rules/<规则名>/（原有猜测，保留）；
+       *   4) files 根。每处试 <name>.js 与 <name> 两种形态。 */
+      var rn5 = HK.ruleName() || '';
+      var cand = [], seenC = {};
+      var pushCand = function (p) { if (p && !seenC[p]) { seenC[p] = 1; cand.push(p); } };
+      var fk = str(fromKey || '');
+      if (/^hiker:\/\/files\//.test(fk) && fk.indexOf('/') >= 0) {
+        var dir = fk.slice(0, fk.lastIndexOf('/') + 1);
+        pushCand(dir + key + '.js'); pushCand(dir + key);
+      }
+      pushCand('hiker://files/data/' + rn5 + '/subpage/' + key + '.js');
+      pushCand('hiker://files/data/' + rn5 + '/subpage/' + key);
+      pushCand('hiker://files/data/' + rn5 + '/' + key + '.js');
+      pushCand('hiker://files/data/' + rn5 + '/' + key);
+      pushCand('hiker://files/rules/' + rn5 + '/' + key + '.js');
+      pushCand('hiker://files/' + key + '.js');
+      pushCand('hiker://files/' + key);
+      for (var ci = 0; ci < cand.length; ci++) {
+        var cc = fileRead(cand[ci]);
+        if (trim(cc)) return runModule(key, cc, cacheKey, param);
+      }
       emit('hk.error', '模块不存在: ' + key);
       return null;
     }
@@ -1686,12 +1718,34 @@
     }
     return pairs.length ? '\n;try{__cap({' + pairs.join(',') + '});}catch(e){}' : '';
   }
+  /* [FIX3-BUG7] 收割镜像到全局对象：FIX2 的「收割+注入」只在作用域
+   * 构建时注入，覆盖不了「同一次执行内 require 完立刻读」——CMS模板的
+   * 升级 lazy 里 require(zyw.js) 定义 var version={...}，紧接着同函数内
+   * 读 version.requireId，本次作用域早已建好，注入赶不上趟（sim 复跑
+   * 实证 ReferenceError）。官方引擎里模块顶层 var 本就落在共享全局、
+   * require 返回后立即可见，这里在收割时把名字同步镜像到 global：
+   * with 作用域查不到的名字会动态落到全局对象，正好补上这个时序缺口；
+   * 后续执行的注入（作用域内同名）仍优先于全局，不改变既有语义。
+   * 护栏：只写「全局上原本没有」或「由本机制放置过」的名字，绝不覆盖
+   * window 既有属性（fetch/document/name 等）；放置过的名字记在
+   * SHARED_PLACED 里，跨规则同名定义按最近一次收割更新（与官方共享
+   * 全局的行为一致）。 */
+  var SHARED_PLACED = {};
+  function mirrorSharedToGlobal(k, v) {
+    if (k === '__scope' || k === '__cap') return;
+    try {
+      if (!(k in global) || SHARED_PLACED[k]) { global[k] = v; SHARED_PLACED[k] = 1; }
+    } catch (e) {}
+  }
   function makeCap() {
     return function (bag) {
       if (!bag) return;
       var rn = HK.ruleName() || '';
       var bag2 = STORE.shared[rn] || (STORE.shared[rn] = {});
-      for (var k in bag) if (has(bag, k) && bag[k] !== undefined) bag2[k] = bag[k];
+      for (var k in bag) if (has(bag, k) && bag[k] !== undefined) {
+        bag2[k] = bag[k];
+        mirrorSharedToGlobal(k, bag[k]);
+      }
     };
   }
 
@@ -1705,6 +1759,7 @@
     if (v.MY_URL !== undefined) PAGE.url = str(v.MY_URL);
     if (v.MY_KEYWORD !== undefined) PAGE.keyword = str(v.MY_KEYWORD);
     if (v.MY_PAGE !== undefined) PAGE.page = v.MY_PAGE;
+    if (v.MY_INDEX !== undefined) PAGE.index = v.MY_INDEX;
     if (v.MY_TITLE !== undefined) PAGE.title = str(v.MY_TITLE);
     if (v.MY_PIC !== undefined) PAGE.pic = str(v.MY_PIC);
     if (v.input !== undefined) PAGE.input = v.input;
